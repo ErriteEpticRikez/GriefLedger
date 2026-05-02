@@ -2,6 +2,7 @@
 A Vintage Story server side mod that logs interactions in the game world with SQLite.
 
 In-Game Commands:
+
 /blocklog -p 1 -r 5
 -p flag is for page number
 -r flag is for radius
