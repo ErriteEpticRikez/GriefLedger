@@ -1,0 +1,14 @@
+{
+    "$schema": "https://moddbcdn.vintagestory.at/schema/modinfo.latest.json",
+    "type": "Code",
+    "modid": "griefwarden",
+    "name": "GriefWarden",
+    "authors": [
+        "Windwhistle"
+    ],
+    "description": "Keeps an in-game accessible log of various types of things done in-game.",
+    "version": "1.0.0",
+    "side": "Server",
+    "requiredOnClient": false,
+    "requiredOnServer": true
+}
