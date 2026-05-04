@@ -50,7 +50,7 @@ public class Commands {
 
     private void OnEntityLogCommand(IServerPlayer player, int groupId, CmdArgs args) {
         int pageNum = 1;
-        int radiusToUse = 0;
+        int radiusToUse = 5;
         while (args.Length > 0) {
             string argFlag = args.PopWord();
             switch (argFlag) {
@@ -58,7 +58,7 @@ public class Commands {
                     pageNum = (int)args.PopInt(1);
                     break;
                 case "-r":
-                    radiusToUse = (int)args.PopInt(0);
+                    radiusToUse = (int)args.PopInt(5);
                     break;
             }
         }
