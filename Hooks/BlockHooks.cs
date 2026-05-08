@@ -33,7 +33,8 @@ public class BlockHooks {
         }
 
         Vec3i blockPosition = blockSel.Position.ToLocalPosition(Main.API);
-        Main.Database.AddBlockLog(playerName, playerUID, "BROKE", block.ToString(), itemstack, blockPosition.X, blockPosition.Y, blockPosition.Z);
+        
+        Main.Database.AddBlockLog(playerName, playerUID, "BROKE", block.ToString(), itemstack, blockPosition.X, blockPosition.Y, blockPosition.Z, null);
     }
 
     private void OnDidBlockPlace(IServerPlayer player, int oldBlockID, BlockSelection blockSel, ItemStack withItemStack) {
@@ -50,7 +51,7 @@ public class BlockHooks {
         }
 
         Vec3i blockPosition = blockSel.Position.ToLocalPosition(Main.API);
-        Main.Database.AddBlockLog(playerName, playerUID, "PLACED", block.ToString(), null, blockPosition.X, blockPosition.Y, blockPosition.Z);
+        Main.Database.AddBlockLog(playerName, playerUID, "PLACED", block.ToString(), null, blockPosition.X, blockPosition.Y, blockPosition.Z, oldBlockID);
     }
 
     private void OnDidBlockUse(IServerPlayer player, BlockSelection blockSel) {
@@ -77,6 +78,6 @@ public class BlockHooks {
         }
 
         Vec3i blockPosition = blockSel.Position.ToLocalPosition(Main.API);
-        Main.Database.AddBlockLog(playerName, playerUID, "USED", block.ToString(), itemstack, blockPosition.X, blockPosition.Y, blockPosition.Z);
+        Main.Database.AddBlockLog(playerName, playerUID, "USED", block.ToString(), itemstack, blockPosition.X, blockPosition.Y, blockPosition.Z, null);
     }
 }

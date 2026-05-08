@@ -7,11 +7,16 @@ using System.IO;
 using System.Threading;
 using Vintagestory.API.Common;
 using Vintagestory.API.Config;
+using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 
 namespace GriefWarden;
 
 public class Database : IDisposable {
+    // Used for rollback
+    private int worldOriginX = -512000;//-127990;
+    private int worldOriginZ = -512000;//-128009;
+
     private string dbPath;
     private int logLimit = 4;
 
@@ -125,6 +130,22 @@ public class Database : IDisposable {
                 cmd.ExecuteNonQuery();
                 cmd.CommandText = createContainerLogsTable;
                 cmd.ExecuteNonQuery();
+
+                // Add oldblockid column to blocklogs if it doesn't exist
+                cmd.CommandText = "PRAGMA table_info(blocklogs);";
+                bool hasOldBlock = false;
+                using (var reader = cmd.ExecuteReader()) {
+                    while (reader.Read()) {
+                        if (reader.GetString(1) == "oldblockid") {
+                            hasOldBlock = true;
+                            break;
+                        }
+                    }
+                }
+                if (!hasOldBlock) {
+                    cmd.CommandText = "ALTER TABLE blocklogs ADD COLUMN oldblockid INTEGER;";
+                    cmd.ExecuteNonQuery();
+                }
 
                 // Add actiontype column to containerlogs if it doesn't exist (for backwards compatibility)
                 cmd.CommandText = "PRAGMA table_info(containerlogs);";
@@ -522,15 +543,15 @@ public class Database : IDisposable {
         }
     }
 
-    public void AddBlockLog(string? playername, string? playeruid, string actiontype, string block, string? itemstack, int x, int y, int z) {
+    public void AddBlockLog(string? playername, string? playeruid, string actiontype, string block, string? itemstack, int x, int y, int z, int? oldblockid) {
         long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         databaseTasks.Enqueue((connection) => {
             int playerId = GetOrInsertPlayer(connection, playername, playeruid);
             var compressed = CompressText(itemstack);
 
             using var cmd = connection.CreateCommand();
-            cmd.CommandText = @"INSERT INTO blocklogs (timestamp_utc, player_id, actiontype, block, itemstack_data, itemstack_encoding, x, y, z)
-            VALUES ($timestamp, $player_id, $actiontype, $block, $itemstack_data, $itemstack_encoding, $x, $y, $z)";
+            cmd.CommandText = @"INSERT INTO blocklogs (timestamp_utc, player_id, actiontype, block, itemstack_data, itemstack_encoding, x, y, z, oldblockid)
+            VALUES ($timestamp, $player_id, $actiontype, $block, $itemstack_data, $itemstack_encoding, $x, $y, $z, $oldblockid)";
 
             cmd.Parameters.AddWithValue("$timestamp", timestamp);
             cmd.Parameters.AddWithValue("$player_id", playerId == -1 ? DBNull.Value : playerId);
@@ -541,8 +562,106 @@ public class Database : IDisposable {
             cmd.Parameters.AddWithValue("$x", x);
             cmd.Parameters.AddWithValue("$y", y);
             cmd.Parameters.AddWithValue("$z", z);
+            cmd.Parameters.AddWithValue("$oldblockid", oldblockid ?? (object)DBNull.Value);
 
             cmd.ExecuteNonQuery();
+        });
+    }
+
+    public void RollbackBreaks(IServerPlayer player, int groupId, int x, int y, int z, int radius, string playername) {
+        // Read on a separate thread/connection to not block main thread
+        System.Threading.Tasks.Task.Run(() => {
+            using var connection = new SqliteConnection("Data Source=" + dbPath);
+            connection.Open();
+
+            using var cmd = connection.CreateCommand();
+
+            string? playerid = null;
+            cmd.CommandText = @"SELECT * FROM players
+            WHERE last_playername = $playername";
+            cmd.Parameters.AddWithValue("$playername", playername);
+            using (var reader = cmd.ExecuteReader()) {
+                if (reader.HasRows) {
+                    while (reader.Read()) {
+                        playerid = reader.GetString(0);
+                        break;
+                    }
+                }
+                else {
+                    Main.API.Event.EnqueueMainThreadTask(() => {
+                        Main.API.SendMessage(player, GlobalConstants.InfoLogChatGroup, "No player logged with that username.", EnumChatType.CommandSuccess);
+                    }, "SendRollbackFail");
+                    return;
+                }
+            }
+
+            cmd.CommandText = @"SELECT * FROM blocklogs
+            WHERE player_id = $playerid
+            AND actiontype = 0
+            AND x BETWEEN $x - $radius AND $x + $radius
+            AND y BETWEEN $y - $radius AND $y + $radius
+            AND z BETWEEN $z - $radius AND $z + $radius";
+
+            cmd.Parameters.AddWithValue("$x", x);
+            cmd.Parameters.AddWithValue("$y", y);
+            cmd.Parameters.AddWithValue("$z", z);
+            cmd.Parameters.AddWithValue("$radius", radius);
+            cmd.Parameters.AddWithValue("$playerid", playerid);
+
+            Dictionary<string, (BlockPos, long, int)> rollbackToSet = new();
+
+            var logs = new List<string>();
+            using (var reader = cmd.ExecuteReader()) {
+                if (reader.HasRows) {
+                    while (reader.Read()) {
+                        long tsSeconds = reader.GetInt64(1);
+
+                        string block = reader.IsDBNull(4) ? "" : reader.GetString(4);
+                        if (block.Contains("chiseled"))
+                            continue;
+
+                        int indexOfIDChar = block.IndexOf('/');
+                        if (indexOfIDChar == -1)
+                            continue;
+                        string blockIDStr = block.Substring(indexOfIDChar + 1, block.Length - indexOfIDChar - 1);
+
+                        int blockID = Convert.ToInt32(blockIDStr);
+                        if (blockID == 0)
+                            continue;
+
+                        int logX = reader.GetInt32(7);
+                        int logY = reader.GetInt32(8);
+                        int logZ = reader.GetInt32(9);
+
+                        string currentRollbackValueKey = logX + "|" + logY + "|" + logZ;
+                        try {
+                            (BlockPos, long, int) currentRollbackValue = rollbackToSet[currentRollbackValueKey];
+                            if (currentRollbackValue.Item2 > tsSeconds) {
+                                BlockPos savedBlockPos = rollbackToSet[currentRollbackValueKey].Item1;
+                                rollbackToSet[currentRollbackValueKey] = (savedBlockPos, tsSeconds, blockID);
+                            }
+                        }
+                        catch (KeyNotFoundException) {
+                            BlockPos blockPos = new BlockPos(logX + (int)Main.API.World.DefaultSpawnPosition.X, logY, logZ + (int)Main.API.World.DefaultSpawnPosition.Z);
+                            rollbackToSet[currentRollbackValueKey] = (blockPos, tsSeconds, blockID);
+                        }
+                    }
+                    logs.Add("Rolled back blocks broken by " + playername + " in a radius of " + radius + ".");
+                }
+                else {
+                    logs.Add("Nothing to rollback.");
+                }
+            }
+
+            Main.API.Event.EnqueueMainThreadTask(() => {
+                foreach (KeyValuePair<string, (BlockPos, long, int)> entry in rollbackToSet) {
+                    Main.API.World.BlockAccessor.SetBlock(entry.Value.Item3, entry.Value.Item1);
+                }
+
+                foreach (var log in logs) {
+                    Main.API.SendMessage(player, GlobalConstants.InfoLogChatGroup, log, EnumChatType.CommandSuccess);
+                }
+            }, "SendRollback");
         });
     }
 

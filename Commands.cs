@@ -11,9 +11,34 @@ public class Commands {
         Main.API.Permissions.RegisterPrivilege("griefwarden", "Use GriefWarden commands.", true);
 
         //Main.API.ChatCommands.Create("blocklog").WithDescription("Inspect block logs at block looked at.").RequiresPrivilege("griefwarden").HandleWith(new CommandDel(this.OnBlockLogCommand));
-        Main.API.RegisterCommand("blocklog", "Inspect block logs at block looked at if no radius is specified, or around the player if radius is.", "radius#", new ServerChatCommandDelegate(this.OnBlockLogCommand), "griefwarden");
-        Main.API.RegisterCommand("entitylog", "Inspect entity logs in radius around you.", "radius#", new ServerChatCommandDelegate(this.OnEntityLogCommand), "griefwarden");
-        Main.API.RegisterCommand("containerlog", "Inspect container logs at container looked at.", "", new ServerChatCommandDelegate(this.OnContainerLogCommand), "griefwarden");
+        Main.API.RegisterCommand("rollbackbreaks", "Revert BROKE changes made by a specific player in a radius. If no radius is specified, it defaults to 5.", "-p USERNAME -r #", new ServerChatCommandDelegate(this.OnRollbackBreaksCommand), "griefwarden");
+        Main.API.RegisterCommand("blocklog", "Inspect block logs at block looked at if no radius is specified, or around the player if radius is.", "-r # -p #", new ServerChatCommandDelegate(this.OnBlockLogCommand), "griefwarden");
+        Main.API.RegisterCommand("entitylog", "Inspect entity logs in radius around you.", "-r # -p #", new ServerChatCommandDelegate(this.OnEntityLogCommand), "griefwarden");
+        Main.API.RegisterCommand("containerlog", "Inspect container logs at container looked at.", "-p #", new ServerChatCommandDelegate(this.OnContainerLogCommand), "griefwarden");
+    }
+
+    private void OnRollbackBreaksCommand(IServerPlayer player, int groupId, CmdArgs args) {
+        string? playerName = null;
+        int radiusToUse = 5;
+        while (args.Length > 0) {
+            string argFlag = args.PopWord();
+            switch (argFlag) {
+                case "-p":
+                    playerName = args.PopWord();
+                    break;
+                case "-r":
+                    radiusToUse = (int)args.PopInt(5);
+                    break;
+            }
+        }
+        if (playerName == null) {
+            Main.API.SendMessage(player, groupId, "You need to specify a player's username with \"-p USERNAME\".", EnumChatType.CommandError);
+            return;
+        }
+
+        Vec3i playerPosition = player.Entity.Pos.XYZ.AsBlockPos.ToLocalPosition(Main.API);
+
+        Main.Database.RollbackBreaks(player, groupId, playerPosition.X, playerPosition.Y, playerPosition.Z, radiusToUse, playerName);
     }
 
     private void OnBlockLogCommand(IServerPlayer player, int groupId, CmdArgs args) {
