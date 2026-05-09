@@ -1,5 +1,6 @@
 ﻿using GriefWarden.Hooks;
 using HarmonyLib;
+using System.Collections.Generic;
 using Vintagestory.API.Common;
 using Vintagestory.API.Server;
 
@@ -9,6 +10,7 @@ public class Main : ModSystem {
     private Harmony harmony = null;
     public static ICoreServerAPI API { get; private set; }
     public static Database Database { get; private set; }
+    public static Dictionary<string, string> CachedPlayerUsernames { get; private set; } = new();
 
     public override bool ShouldLoad(EnumAppSide forSide) {
         return forSide == EnumAppSide.Server;
@@ -23,6 +25,8 @@ public class Main : ModSystem {
 
         new Commands();
 
+        API.Event.PlayerJoin += OnPlayerJoin;
+
         harmony = new Harmony(Mod.Info.ModID);
         harmony.PatchAll();
     }
@@ -31,5 +35,9 @@ public class Main : ModSystem {
         Database.Dispose();
 
         harmony?.UnpatchAll(Mod.Info.ModID);
+    }
+
+    private void OnPlayerJoin(IServerPlayer player) {
+        CachedPlayerUsernames[player.PlayerUID] = player.PlayerName;
     }
 }

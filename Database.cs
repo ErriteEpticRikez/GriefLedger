@@ -131,6 +131,10 @@ public class Database : IDisposable {
                 cmd.CommandText = createContainerLogsTable;
                 cmd.ExecuteNonQuery();
 
+                // Prune all blocklogs USED actions
+                cmd.CommandText = "DELETE FROM blocklogs WHERE actiontype = 2;";
+                cmd.ExecuteNonQuery();
+
                 // Add oldblockid column to blocklogs if it doesn't exist
                 cmd.CommandText = "PRAGMA table_info(blocklogs);";
                 bool hasOldBlock = false;

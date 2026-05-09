@@ -8,7 +8,7 @@ public class BlockHooks {
     public BlockHooks() {
         Main.API.Event.DidBreakBlock += this.OnDidBlockBreak;
         Main.API.Event.DidPlaceBlock += this.OnDidBlockPlace;
-        Main.API.Event.DidUseBlock += this.OnDidBlockUse;
+        //Main.API.Event.DidUseBlock += this.OnDidBlockUse;
     }
 
     private void OnDidBlockBreak(IServerPlayer player, int oldBlockID, BlockSelection blockSel) {
