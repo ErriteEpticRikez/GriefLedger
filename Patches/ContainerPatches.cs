@@ -247,6 +247,7 @@ public class BlockEntityShelfPatch {
         public ItemStack?[] itemstacksInPrefix;
     }
 }
+
 [HarmonyPatch(typeof(BlockEntityShelf), "TryPut")]
 public class BlockEntityShelfPutPatch {
     [HarmonyPrefix]
@@ -268,6 +269,68 @@ public class BlockEntityShelfPutPatch {
                 int quantity = stackBefore == null ? stackAfter.StackSize : stackAfter.StackSize - stackBefore.StackSize;
                 if (byPlayer != null) {
                     Main.Database.AddContainerLog(byPlayer.PlayerName, byPlayer.PlayerUID, "PLACED", __instance.Inventory.InventoryID, stackAfter.GetName(), quantity);
+                }
+                break;
+            }
+        }
+    }
+
+    public class PatchState {
+        public ItemStack?[] itemstacksInPrefix;
+    }
+}
+
+[HarmonyPatch(typeof(BlockEntityToolrack), "PutInSlot")]
+public class BlockEntityToolrackPutPatch {
+    [HarmonyPrefix]
+    public static void Prefix(BlockEntityToolrack __instance, IPlayer player, int slot, out PatchState __state) {
+        __state = new PatchState();
+        __state.itemstacksInPrefix = new ItemStack?[__instance.inventory.Count];
+        for (int i = 0; i < __instance.inventory.Count; i++) {
+            __state.itemstacksInPrefix[i] = __instance.inventory[i].Itemstack?.Clone();
+        }
+    }
+
+    [HarmonyPostfix]
+    public static void Postfix(BlockEntityToolrack __instance, IPlayer player, int slot, PatchState __state) {
+        for (int i = 0; i < __instance.inventory.Count; i++) {
+            ItemStack? stackBefore = __state.itemstacksInPrefix[i];
+            ItemStack? stackAfter = __instance.inventory[i].Itemstack;
+
+            if (stackAfter != null && stackBefore == null) {
+                if (player != null) {
+                    Main.Database.AddContainerLog(player.PlayerName, player.PlayerUID, "PLACED", __instance.inventory.InventoryID, stackAfter.GetName(), 1);
+                }
+                break;
+            }
+        }
+    }
+
+    public class PatchState {
+        public ItemStack?[] itemstacksInPrefix;
+    }
+}
+
+[HarmonyPatch(typeof(BlockEntityToolrack), "TakeFromSlot")]
+public class BlockEntityToolrackTakePatch {
+    [HarmonyPrefix]
+    public static void Prefix(BlockEntityToolrack __instance, IPlayer player, int slot, out PatchState __state) {
+        __state = new PatchState();
+        __state.itemstacksInPrefix = new ItemStack?[__instance.inventory.Count];
+        for (int i = 0; i < __instance.inventory.Count; i++) {
+            __state.itemstacksInPrefix[i] = __instance.inventory[i].Itemstack?.Clone();
+        }
+    }
+
+    [HarmonyPostfix]
+    public static void Postfix(BlockEntityToolrack __instance, IPlayer player, int slot, PatchState __state) {
+        for (int i = 0; i < __instance.inventory.Count; i++) {
+            ItemStack? stackBefore = __state.itemstacksInPrefix[i];
+            ItemStack? stackAfter = __instance.inventory[i].Itemstack;
+
+            if (stackBefore != null && stackAfter == null) {
+                if (player != null) {
+                    Main.Database.AddContainerLog(player.PlayerName, player.PlayerUID, "TAKEN", __instance.inventory.InventoryID, stackBefore.GetName(), 1);
                 }
                 break;
             }

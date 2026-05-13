@@ -112,6 +112,12 @@ public class Commands {
                 Main.Database.CheckContainerLog(pageNum, player, groupId, inventory.InventoryID);
                 return;
             }
+            // Special case for toolracks
+            if (blockEnt is BlockEntityToolrack toolRack) {
+                IInventory inventory = toolRack.inventory;
+                Main.Database.CheckContainerLog(pageNum, player, groupId, inventory.InventoryID);
+                return;
+            }
         }
 
         // mountedbaginv-(slotnum)-(entityID)

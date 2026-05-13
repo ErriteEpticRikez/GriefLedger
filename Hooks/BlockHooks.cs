@@ -1,6 +1,7 @@
 ﻿using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
+using Vintagestory.GameContent;
 
 namespace GriefWarden.Hooks;
 
@@ -8,7 +9,7 @@ public class BlockHooks {
     public BlockHooks() {
         Main.API.Event.DidBreakBlock += this.OnDidBlockBreak;
         Main.API.Event.DidPlaceBlock += this.OnDidBlockPlace;
-        //Main.API.Event.DidUseBlock += this.OnDidBlockUse;
+        Main.API.Event.DidUseBlock += this.OnDidBlockUse;
     }
 
     private void OnDidBlockBreak(IServerPlayer player, int oldBlockID, BlockSelection blockSel) {
@@ -60,6 +61,10 @@ public class BlockHooks {
 
         Block block = Main.API.World.BlockAccessor.GetBlock(blockSel.Position);
         if (block == null)
+            return;
+
+        // Check if translocator
+        if (!block.ToString().Contains("statictranslocator"))
             return;
 
         string? playerName = null;
