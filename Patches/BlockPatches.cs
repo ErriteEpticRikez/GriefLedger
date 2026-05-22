@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Text;
 using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
+using Vintagestory.GameContent;
 
 namespace GriefWarden.Patches;
 
@@ -31,5 +32,44 @@ public class BlockOnBlockExplodedPatch {
 
     public class PatchState {
         public string oldBlockStr;
+    }
+}
+
+[HarmonyPatch(typeof(ItemChisel), nameof(ItemChisel.OnHeldInteractStart))]
+public class ItemChiselInteractPatch {
+    [HarmonyPrefix]
+    public static void Prefix(ItemSlot slot, EntityAgent byEntity, BlockSelection blockSel, out PatchState __state) {
+        BlockPos pos = blockSel.Position;
+        Block block = byEntity.World.BlockAccessor.GetBlock(pos);
+
+        __state = new PatchState();
+        __state.oldBlockID = block.Id;
+        __state.oldBlock = block.ToString();
+    }
+
+    [HarmonyPostfix]
+    public static void Postfix(ItemSlot slot, EntityAgent byEntity, BlockSelection blockSel, PatchState __state) {
+        if (__state.oldBlockID == 648)
+            return;
+
+        BlockPos pos = blockSel.Position;
+        Block block = byEntity.World.BlockAccessor.GetBlock(pos);
+
+        if (block.Id != 648)
+            return;
+
+        EntityPlayer? entityPlayer = byEntity as EntityPlayer;
+        IPlayer? byPlayer = entityPlayer?.Player;
+
+        string? playername = byPlayer?.PlayerName;
+        string? playeruid = byPlayer?.PlayerUID;
+        Vec3i blockPosition = blockSel.Position.ToLocalPosition(Main.API);
+
+        Main.Database.AddBlockLog(playername, playeruid, "USED", __state.oldBlock, "CHISEL", blockPosition.X, blockPosition.Y, blockPosition.Z, __state.oldBlockID);
+    }
+
+    public class PatchState {
+        public int oldBlockID;
+        public string oldBlock;
     }
 }
