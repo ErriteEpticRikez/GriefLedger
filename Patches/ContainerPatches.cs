@@ -341,3 +341,71 @@ public class BlockEntityToolrackTakePatch {
         public ItemStack?[] itemstacksInPrefix;
     }
 }
+
+[HarmonyPatch(typeof(BlockEntityCrate), nameof(BlockEntityCrate.OnBlockInteractStart))]
+public class BlockEntityCrateInteractPatch {
+    [HarmonyPrefix]
+    public static void Prefix(BlockEntityCrate __instance, IPlayer byPlayer, BlockSelection blockSel, out PatchState __state) {
+        __state = new PatchState();
+
+        __state.itemstacksInPrefix = new ItemStack?[__instance.Inventory.Count];
+
+        for (int i = 0; i < __instance.Inventory.Count; i++) {
+            __state.itemstacksInPrefix[i] = __instance.Inventory[i].Itemstack?.Clone();
+        }
+    }
+
+    [HarmonyPostfix]
+    public static void Postfix(BlockEntityCrate __instance, IPlayer byPlayer, BlockSelection blockSel, PatchState __state) {
+        CollectibleObject? itemMovedInOrOut = null;
+        int quantity = 0;
+        bool goingIn = false;
+
+        for (int i = 0; i < __instance.Inventory.Count; i++) {
+            ItemStack? stackBefore = __state.itemstacksInPrefix[i];
+            ItemStack? stackAfter = __instance.Inventory[i].Itemstack;
+
+            // Item added to empty slot
+            if (stackBefore == null && stackAfter != null) {
+                itemMovedInOrOut = stackAfter.Collectible;
+                quantity += stackAfter.StackSize;
+                goingIn = true;
+                continue;
+            }
+            // Item added to slot
+            if (stackAfter != null && stackBefore.StackSize < stackAfter.StackSize) {
+                itemMovedInOrOut = stackAfter.Collectible;
+                quantity += stackAfter.StackSize - stackBefore.StackSize;
+                goingIn = true;
+                continue;
+            }
+
+            // Item removed ENTIRE from slot
+            if (stackBefore != null && stackAfter == null) {
+                itemMovedInOrOut = stackBefore.Collectible;
+                quantity += stackBefore.StackSize;
+                goingIn = false;
+                continue;
+            }
+            // Item removed from slot
+            if (stackBefore != null && stackBefore.StackSize > stackAfter.StackSize) {
+                itemMovedInOrOut = stackBefore.Collectible;
+                quantity += stackBefore.StackSize - stackAfter.StackSize;
+                goingIn = false;
+                continue;
+            }
+        }
+
+        if (itemMovedInOrOut == null)
+            return;
+
+        string actiontype = goingIn ? "PLACED" : "TAKEN";
+        ItemStack stackChange = new(itemMovedInOrOut);
+
+        Main.Database.AddContainerLog(byPlayer.PlayerName, byPlayer.PlayerUID, actiontype, __instance.Inventory.InventoryID, stackChange.GetName(), quantity);
+    }
+
+    public class PatchState {
+        public ItemStack?[] itemstacksInPrefix;
+    }
+}
