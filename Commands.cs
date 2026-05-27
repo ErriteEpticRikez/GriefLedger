@@ -13,7 +13,7 @@ public class Commands {
         //Main.API.ChatCommands.Create("blocklog").WithDescription("Inspect block logs at block looked at.").RequiresPrivilege("griefwarden").HandleWith(new CommandDel(this.OnBlockLogCommand));
         Main.API.RegisterCommand("rollbackbreaks", "Revert BROKE changes made by a specific player in a radius. If no radius is specified, it defaults to 5.", "-p USERNAME -r #", new ServerChatCommandDelegate(this.OnRollbackBreaksCommand), "griefwarden");
         Main.API.RegisterCommand("blocklog", "Inspect block logs at block looked at if no radius is specified, or around the player if radius is.", "-r # -p #", new ServerChatCommandDelegate(this.OnBlockLogCommand), "griefwarden");
-        Main.API.RegisterCommand("entitylog", "Inspect entity logs in radius around you.", "-r # -p #", new ServerChatCommandDelegate(this.OnEntityLogCommand), "griefwarden");
+        Main.API.RegisterCommand("entitylog", "Inspect entity logs in radius around you.", "(-r # OR -e ENTITYID) -p #", new ServerChatCommandDelegate(this.OnEntityLogCommand), "griefwarden");
         Main.API.RegisterCommand("containerlog", "Inspect container logs at container looked at.", "-p #", new ServerChatCommandDelegate(this.OnContainerLogCommand), "griefwarden");
     }
 
@@ -76,6 +76,7 @@ public class Commands {
     private void OnEntityLogCommand(IServerPlayer player, int groupId, CmdArgs args) {
         int pageNum = 1;
         int radiusToUse = 5;
+        string? entityID = null;
         while (args.Length > 0) {
             string argFlag = args.PopWord();
             switch (argFlag) {
@@ -85,12 +86,20 @@ public class Commands {
                 case "-r":
                     radiusToUse = (int)args.PopInt(5);
                     break;
+                case "-e":
+                    entityID = args.PopWord();
+                    break;
             }
         }
 
-        Vec3i playerPosition = player.Entity.Pos.XYZ.AsBlockPos.ToLocalPosition(Main.API);
+        if (entityID == null) {
+            Vec3i playerPosition = player.Entity.Pos.XYZ.AsBlockPos.ToLocalPosition(Main.API);
 
-        Main.Database.CheckEntityLog(pageNum, player, groupId, playerPosition.X, playerPosition.Y, playerPosition.Z, radiusToUse);
+            Main.Database.CheckEntityLog(pageNum, player, groupId, playerPosition.X, playerPosition.Y, playerPosition.Z, radiusToUse);
+        }
+        else {
+            Main.Database.CheckEntityLogWithEntityID(pageNum, player, groupId, entityID);
+        }
     }
 
     private void OnContainerLogCommand(IServerPlayer player, int groupId, CmdArgs args) {

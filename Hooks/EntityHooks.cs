@@ -32,6 +32,7 @@ public class EntityHooks {
         string? playername = null;
         string? playeruid = null;
         string? itemstack = null;
+        string reasonAddon = "";
 
         if (damageSource != null) {
             Entity? causeEntity = damageSource.GetCauseEntity();
@@ -45,10 +46,15 @@ public class EntityHooks {
                         itemstack = activeSlot.Itemstack.GetName();
                 }
             }
+            else {
+                //playername = damageSource.Source.ToString();
+                //playeruid = "x";
+                reasonAddon = " BECAUSE OF " + damageSource.Source.ToString();
+            }
         }
 
         Vec3i entityPosition = entity.Pos.XYZ.AsBlockPos.ToLocalPosition(Main.API);
-        Main.Database.AddEntityLog(playername, playeruid, "KILLED", entity.GetName(), entity.EntityId.ToString(), itemstack, entityPosition.X, entityPosition.Y, entityPosition.Z);
+        Main.Database.AddEntityLog(playername, playeruid, "KILLED", entity.GetName() + reasonAddon, entity.EntityId.ToString(), itemstack, entityPosition.X, entityPosition.Y, entityPosition.Z);
     }
 
     /*private void OnEntitySpawn(Entity entity) {

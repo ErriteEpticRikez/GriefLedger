@@ -828,6 +828,70 @@ public class Database : IDisposable {
         });
     }
 
+    public void CheckEntityLogWithEntityID(int pageNum, IServerPlayer player, int groupId, string entityID) {
+        System.Threading.Tasks.Task.Run(() => {
+            using var connection = new SqliteConnection("Data Source=" + dbPath);
+            connection.Open();
+            int skipLogsNum = logLimit * (pageNum - 1);
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"SELECT e.id, e.timestamp_utc, p.last_playername, p.playeruid, e.actiontype, e.entityname, e.entityid, e.itemstack_data, e.itemstack_encoding, e.x, e.y, e.z FROM (
+            SELECT * FROM entitylogs
+            WHERE entityid = $entityid
+            ORDER BY id DESC
+            LIMIT $loglimit
+            OFFSET $skiplognum) e
+            LEFT JOIN players p ON e.player_id = p.id
+            ORDER BY e.id ASC";
+
+            cmd.Parameters.AddWithValue("$entityid", entityID);
+            cmd.Parameters.AddWithValue("$loglimit", logLimit);
+            cmd.Parameters.AddWithValue("$skiplognum", skipLogsNum);
+
+            var logs = new List<string>();
+            using (var reader = cmd.ExecuteReader()) {
+                if (reader.HasRows) {
+                    logs.Add("<strong><font color=\"white\">---------- PAGE " + pageNum + " ----------</font></strong>");
+                    while (reader.Read()) {
+                        long tsSeconds = reader.GetInt64(1);
+                        string timestamp = DateTimeOffset.FromUnixTimeSeconds(tsSeconds).UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss");
+
+                        string? playername = reader.IsDBNull(2) ? null : reader.GetString(2);
+                        string? playeruid = reader.IsDBNull(3) ? null : reader.GetString(3);
+
+                        int actiontypeInt = reader.GetInt32(4);
+                        string actiontype = ReverseActionTypeMap.TryGetValue(actiontypeInt, out string aType) ? aType : "UNKNOWN";
+
+                        string entityname = reader.IsDBNull(5) ? "" : reader.GetString(5);
+                        string entityid = reader.IsDBNull(6) ? "" : reader.GetString(6);
+
+                        byte[]? itemstackData = reader.IsDBNull(7) ? null : (byte[])reader[7];
+                        int itemstackEncoding = reader.GetInt32(8);
+                        string? itemstack = DecompressText(itemstackData, itemstackEncoding);
+
+                        int logX = reader.GetInt32(9);
+                        int logY = reader.GetInt32(10);
+                        int logZ = reader.GetInt32(11);
+
+                        string playerStr = playername == null ? "" : "<strong>{1}</strong>({2}) ";
+                        string itemstackStr = itemstack == null ? "" : "with {6} ";
+                        string logString = String.Format("<strong><font color=\"#6F88DB\">{0}</font></strong> | " + playerStr + "{3} {4}({5}) " + itemstackStr + "@ <strong><font color=\"#9BD1EC\">{7}, {8}, {9}</font></strong>", timestamp, playername, playeruid, actiontype, entityname, entityid, itemstack, logX, logY, logZ);
+                        logs.Add(logString);
+                    }
+                }
+                else {
+                    logs.Add("No entity logs found.");
+                }
+            }
+
+            Main.API.Event.EnqueueMainThreadTask(() => {
+                foreach (var log in logs) {
+                    Main.API.SendMessage(player, GlobalConstants.InfoLogChatGroup, log, EnumChatType.CommandSuccess);
+                }
+            }, "SendEntityLogWithEntityID");
+        });
+    }
+
     public void AddContainerLog(string playername, string playeruid, string actiontype, string containerid, string itemstack, int quantity) {
         long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         databaseTasks.Enqueue((connection) => {
