@@ -14,3 +14,6 @@ Without radius flag specified, will default to radius of 5
 
 /containerlog -p 1
 No radius for this, look at the container, or look at the entity (elk/boat/raft), that would have the container
+
+/tpboatid -e ENTITYID
+This will teleport the boat with ENTITYID to the admin's location, and will force load the last known chunk location if the chunk is not already loaded to do so.
