@@ -13,10 +13,6 @@ using Vintagestory.API.Server;
 namespace GriefWarden;
 
 public class Database : IDisposable {
-    // Used for rollback
-    private int worldOriginX = -512000;//-127990;
-    private int worldOriginZ = -512000;//-128009;
-
     private string dbPath;
     private int logLimit = 4;
 
@@ -890,6 +886,32 @@ public class Database : IDisposable {
                 }
             }, "SendEntityLogWithEntityID");
         });
+    }
+
+    public (int, int, int)? GetLastEntityCoordsLog(string entityID) {
+        using var connection = new SqliteConnection("Data Source=" + dbPath);
+        connection.Open();
+
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = @"SELECT x, y, z
+        FROM entitylogs
+        WHERE entityid = $entityid
+        ORDER BY id DESC
+        LIMIT 1";
+
+        cmd.Parameters.AddWithValue("$entityid", entityID);
+
+        using var reader = cmd.ExecuteReader();
+
+        if (reader.Read()) {
+            int x = reader.GetInt32(0);
+            int y = reader.GetInt32(1);
+            int z = reader.GetInt32(2);
+
+            return (x, y, z);
+        }
+
+        return null;
     }
 
     public void AddContainerLog(string playername, string playeruid, string actiontype, string containerid, string itemstack, int quantity) {

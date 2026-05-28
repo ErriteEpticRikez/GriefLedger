@@ -1,5 +1,8 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 using Vintagestory.API.Common;
+using Vintagestory.API.Common.Entities;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 using Vintagestory.GameContent;
@@ -15,6 +18,7 @@ public class Commands {
         Main.API.RegisterCommand("blocklog", "Inspect block logs at block looked at if no radius is specified, or around the player if radius is.", "-r # -p #", new ServerChatCommandDelegate(this.OnBlockLogCommand), "griefwarden");
         Main.API.RegisterCommand("entitylog", "Inspect entity logs in radius around you.", "(-r # OR -e ENTITYID) -p #", new ServerChatCommandDelegate(this.OnEntityLogCommand), "griefwarden");
         Main.API.RegisterCommand("containerlog", "Inspect container logs at container looked at.", "-p #", new ServerChatCommandDelegate(this.OnContainerLogCommand), "griefwarden");
+        Main.API.RegisterCommand("tpboatid", "Performs a sequence of events to teleport a boat to you.", "-e ENTITYID", new ServerChatCommandDelegate(this.OnTPBoatID), "griefwarden");
     }
 
     private void OnRollbackBreaksCommand(IServerPlayer player, int groupId, CmdArgs args) {
@@ -147,5 +151,58 @@ public class Commands {
         }
 
         Main.API.SendMessage(player, groupId, "Look at a container, or an entity that can have a container, first. If you're looking at a double chest/trunk, try the other block.", EnumChatType.CommandError);
+    }
+
+    private void tryTPEntityAsBoat(IServerPlayer player, int groupId, Entity entityToTP) {
+        if (entityToTP is EntityBoat boatEntity) {
+            boatEntity.TeleportTo(player.Entity.Pos.XYZ);
+            Main.API.SendMessage(player, groupId, "Teleported boat with ID " + boatEntity.EntityId + " to your position.", EnumChatType.CommandSuccess);
+            return;
+        }
+        Main.API.SendMessage(player, groupId, "That entity is not a boat.", EnumChatType.CommandError);
+    }
+    private void OnTPBoatID(IServerPlayer player, int groupId, CmdArgs args) {
+        long entityID = 0;
+        while (args.Length > 0) {
+            string argFlag = args.PopWord();
+            switch (argFlag) {
+                case "-e":
+                    entityID = Convert.ToInt64(args.PopWord());
+                    break;
+            }
+        }
+        if (entityID == 0) {
+            Main.API.SendMessage(player, groupId, "Could not convert to proper entity ID. Proper usage: /tpboatid -e ENTITYID", EnumChatType.CommandError);
+            return;
+        }
+
+        if (Main.API.World.LoadedEntities.ContainsKey(entityID)) {
+            Entity entityToTP = Main.API.World.LoadedEntities[entityID];
+
+            tryTPEntityAsBoat(player, groupId, entityToTP);
+        }
+        else {
+            (int, int, int)? rawEntityPosition = Main.Database.GetLastEntityCoordsLog(entityID.ToString());
+            if (rawEntityPosition == null) {
+                Main.API.SendMessage(player, groupId, "No entity logs found with that ID. Did you enter the ID in wrong?", EnumChatType.CommandError);
+                return;
+            }
+
+            Vec3d entityPosition = new(rawEntityPosition.Value.Item1 + Main.API.World.DefaultSpawnPosition.X, rawEntityPosition.Value.Item2, rawEntityPosition.Value.Item3 + Main.API.World.DefaultSpawnPosition.Z);
+
+            Main.API.WorldManager.LoadChunkColumnPriority((int)entityPosition.X / 32, (int)entityPosition.Z / 32, new ChunkLoadOptions {
+                OnLoaded = () => {
+                    // Check again to see if entity is loaded, just in case
+                    if (!Main.API.World.LoadedEntities.ContainsKey(entityID)) {
+                        Main.API.SendMessage(player, groupId, "Entity position found, but entity still not loaded in. Something is wrong.", EnumChatType.CommandError);
+                        return;
+                    }
+
+                    Entity entityToTP = Main.API.World.LoadedEntities[entityID];
+
+                    tryTPEntityAsBoat(player, groupId, entityToTP);
+                }
+            });
+        }
     }
 }
