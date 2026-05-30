@@ -690,7 +690,14 @@ public class Database : IDisposable {
             var logs = new List<string>();
             using (var reader = cmd.ExecuteReader()) {
                 if (reader.HasRows) {
+                    int backPageNum = pageNum > 1 ? pageNum - 1 : 1;
+                    int forwardPageNum = pageNum + 1;
+                    string pageCmdStr = "/blocklog -r " + radius + " -p ";
+                    string backPageCmdStr = pageCmdStr + backPageNum;
+                    string forwardPageCmdStr = pageCmdStr + forwardPageNum;
+
                     logs.Add("<strong><font color=\"white\">---------- PAGE " + pageNum + " ----------</font></strong>");
+                    logs.Add("<strong><font color=\"white\">              <a href=\"chattype://" + backPageCmdStr + "\">←←←</a> | <a href=\"chattype://" + forwardPageCmdStr + "\">→→→</a></font></strong>");
                     while (reader.Read()) {
                         long tsSeconds = reader.GetInt64(1);
                         string timestamp = DateTimeOffset.FromUnixTimeSeconds(tsSeconds).UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss");
@@ -783,7 +790,14 @@ public class Database : IDisposable {
             var logs = new List<string>();
             using (var reader = cmd.ExecuteReader()) {
                 if (reader.HasRows) {
+                    int backPageNum = pageNum > 1 ? pageNum - 1 : 1;
+                    int forwardPageNum = pageNum + 1;
+                    string pageCmdStr = "/entitylog -r " + radius + " -p ";
+                    string backPageCmdStr = pageCmdStr + backPageNum;
+                    string forwardPageCmdStr = pageCmdStr + forwardPageNum;
+
                     logs.Add("<strong><font color=\"white\">---------- PAGE " + pageNum + " ----------</font></strong>");
+                    logs.Add("<strong><font color=\"white\">              <a href=\"chattype://" + backPageCmdStr + "\">←←←</a> | <a href=\"chattype://" + forwardPageCmdStr + "\">→→→</a></font></strong>");
                     while (reader.Read()) {
                         long tsSeconds = reader.GetInt64(1);
                         string timestamp = DateTimeOffset.FromUnixTimeSeconds(tsSeconds).UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss");
@@ -847,7 +861,14 @@ public class Database : IDisposable {
             var logs = new List<string>();
             using (var reader = cmd.ExecuteReader()) {
                 if (reader.HasRows) {
+                    int backPageNum = pageNum > 1 ? pageNum - 1 : 1;
+                    int forwardPageNum = pageNum + 1;
+                    string pageCmdStr = "/entitylog -e " + entityID + " -p ";
+                    string backPageCmdStr = pageCmdStr + backPageNum;
+                    string forwardPageCmdStr = pageCmdStr + forwardPageNum;
+
                     logs.Add("<strong><font color=\"white\">---------- PAGE " + pageNum + " ----------</font></strong>");
+                    logs.Add("<strong><font color=\"white\">              <a href=\"chattype://" + backPageCmdStr + "\">←←←</a> | <a href=\"chattype://" + forwardPageCmdStr + "\">→→→</a></font></strong>");
                     while (reader.Read()) {
                         long tsSeconds = reader.GetInt64(1);
                         string timestamp = DateTimeOffset.FromUnixTimeSeconds(tsSeconds).UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss");
@@ -964,7 +985,14 @@ public class Database : IDisposable {
             var logs = new List<string>();
             using (var reader = cmd.ExecuteReader()) {
                 if (reader.HasRows) {
+                    int backPageNum = pageNum > 1 ? pageNum - 1 : 1;
+                    int forwardPageNum = pageNum + 1;
+                    string pageCmdStr = "/containerlog -p ";
+                    string backPageCmdStr = pageCmdStr + backPageNum;
+                    string forwardPageCmdStr = pageCmdStr + forwardPageNum;
+
                     logs.Add("<strong><font color=\"white\">---------- PAGE " + pageNum + " ----------</font></strong>");
+                    logs.Add("<strong><font color=\"white\">              <a href=\"chattype://" + backPageCmdStr + "\">←←←</a> | <a href=\"chattype://" + forwardPageCmdStr + "\">→→→</a></font></strong>");
                     while (reader.Read()) {
                         long tsSeconds = reader.GetInt64(1);
                         string timestamp = DateTimeOffset.FromUnixTimeSeconds(tsSeconds).UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss");

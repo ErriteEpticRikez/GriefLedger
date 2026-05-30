@@ -25,17 +25,12 @@ public class BlockHooks {
             playerName = player.PlayerName;
             playerUID = player.PlayerUID;
 
-            IPlayerInventoryManager invManager = player.InventoryManager;
-            if (invManager != null) {
-                ItemSlot activeSlot = invManager.ActiveHotbarSlot;
-                if (activeSlot != null && activeSlot.Itemstack != null)
-                    itemstack = activeSlot.Itemstack.GetName();
-            }
+            itemstack = Util.GetPlayerCurrentItemstackName(player);
         }
 
         Vec3i blockPosition = blockSel.Position.ToLocalPosition(Main.API);
         
-        Main.Database.AddBlockLog(playerName, playerUID, "BROKE", block.ToString(), itemstack, blockPosition.X, blockPosition.Y, blockPosition.Z, null);
+        Main.Database.AddBlockLog(playerName, playerUID, "BROKE", block.ToString(), itemstack, blockPosition.X, blockPosition.Y, blockPosition.Z, oldBlockID);
     }
 
     private void OnDidBlockPlace(IServerPlayer player, int oldBlockID, BlockSelection blockSel, ItemStack withItemStack) {
@@ -74,12 +69,7 @@ public class BlockHooks {
             playerName = player.PlayerName;
             playerUID = player.PlayerUID;
 
-            IPlayerInventoryManager invManager = player.InventoryManager;
-            if (invManager != null) {
-                ItemSlot activeSlot = invManager.ActiveHotbarSlot;
-                if (activeSlot != null && activeSlot.Itemstack != null)
-                    itemstack = activeSlot.Itemstack.GetName();
-            }
+            itemstack = Util.GetPlayerCurrentItemstackName(player);
         }
 
         Vec3i blockPosition = blockSel.Position.ToLocalPosition(Main.API);

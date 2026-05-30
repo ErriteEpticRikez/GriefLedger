@@ -16,13 +16,7 @@ public class EntityHooks {
         if (entity == null || player == null)
             return;
 
-        string? itemstack = null;
-        IPlayerInventoryManager invManager = player.InventoryManager;
-        if (invManager != null) {
-            ItemSlot activeSlot = invManager.ActiveHotbarSlot;
-            if (activeSlot != null && activeSlot.Itemstack != null)
-                itemstack = activeSlot.Itemstack.GetName();
-        }
+        string? itemstack = Util.GetPlayerCurrentItemstackName(player);
 
         Vec3i entityPosition = entity.Pos.XYZ.AsBlockPos.ToLocalPosition(Main.API);
         Main.Database.AddEntityLog(player.PlayerName, player.PlayerUID, "INTERACTED", entity.GetName(), entity.EntityId.ToString(), itemstack, entityPosition.X, entityPosition.Y, entityPosition.Z);
@@ -39,12 +33,8 @@ public class EntityHooks {
             if (causeEntity != null && causeEntity is EntityPlayer player) {
                 playername = player.Player.PlayerName;
                 playeruid = player.PlayerUID;
-                IPlayerInventoryManager invManager = player.Player.InventoryManager;
-                if (invManager != null) {
-                    ItemSlot activeSlot = invManager.ActiveHotbarSlot;
-                    if (activeSlot != null && activeSlot.Itemstack != null)
-                        itemstack = activeSlot.Itemstack.GetName();
-                }
+
+                itemstack = Util.GetPlayerCurrentItemstackName(player.Player);
             }
             else {
                 //playername = damageSource.Source.ToString();

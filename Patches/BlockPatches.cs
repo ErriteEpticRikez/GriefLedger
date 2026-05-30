@@ -73,3 +73,31 @@ public class ItemChiselInteractPatch {
         public string oldBlock;
     }
 }
+
+[HarmonyPatch(typeof(BlockBehaviorRightClickPickup), nameof(BlockBehaviorRightClickPickup.OnBlockInteractStart))]
+public class BlockBehaviorRightClickPickUpPatch {
+    [HarmonyPrefix]
+    public static void Prefix(BlockBehaviorRightClickPickup __instance, IWorldAccessor world, IPlayer byPlayer, BlockSelection blockSel, out PatchState __state) {
+        __state = new();
+        __state.oldBlockID = __instance.block.Id;
+        __state.oldBlock = __instance.block.ToString();
+    }
+
+    [HarmonyPostfix]
+    public static void Postfix(IWorldAccessor world, IPlayer byPlayer, BlockSelection blockSel, PatchState __state) {
+        Block newBlock = Main.API.World.BlockAccessor.GetBlock(blockSel.Position);
+
+        if (newBlock.Id == __state.oldBlockID)
+            return;
+
+        string? itemstack = Util.GetPlayerCurrentItemstackName(byPlayer);
+        Vec3i blockPosition = blockSel.Position.ToLocalPosition(Main.API);
+
+        Main.Database.AddBlockLog(byPlayer.PlayerName, byPlayer.PlayerUID, "BROKE", __state.oldBlock, itemstack, blockPosition.X, blockPosition.Y, blockPosition.Z, __state.oldBlockID);
+    }
+
+    public class PatchState {
+        public int oldBlockID;
+        public string oldBlock;
+    }
+}
