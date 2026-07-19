@@ -21,9 +21,6 @@ public class Database : IDisposable {
     private ConcurrentQueue<Action<SqliteConnection>> databaseTasks;
     private ConcurrentDictionary<string, (int Id, string? LastPlayerName)> playerCache = new ConcurrentDictionary<string, (int Id, string? LastPlayerName)>();
 
-    private string createSchemaVersionTable = @"CREATE TABLE IF NOT EXISTS schema_version (
-        version INTEGER NOT NULL
-    )";
     private string createPlayersTable = @"CREATE TABLE IF NOT EXISTS players (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         playeruid TEXT UNIQUE,
@@ -39,7 +36,8 @@ public class Database : IDisposable {
         itemstack_encoding INTEGER NOT NULL DEFAULT 0,
         x INTEGER,
         y INTEGER,
-        z INTEGER
+        z INTEGER,
+        oldblockid INTEGER
     )";
     private string createEntityLogsTable = @"CREATE TABLE IF NOT EXISTS entitylogs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,48 +118,14 @@ public class Database : IDisposable {
             }
 
             using (var cmd = connection.CreateCommand()) {
+                cmd.CommandText = createPlayersTable;
+                cmd.ExecuteNonQuery();
                 cmd.CommandText = createBlockLogsTable;
                 cmd.ExecuteNonQuery();
                 cmd.CommandText = createEntityLogsTable;
                 cmd.ExecuteNonQuery();
                 cmd.CommandText = createContainerLogsTable;
                 cmd.ExecuteNonQuery();
-
-                // Add oldblockid column to blocklogs if it doesn't exist
-                cmd.CommandText = "PRAGMA table_info(blocklogs);";
-                bool hasOldBlock = false;
-                using (var reader = cmd.ExecuteReader()) {
-                    while (reader.Read()) {
-                        if (reader.GetString(1) == "oldblockid") {
-                            hasOldBlock = true;
-                            break;
-                        }
-                    }
-                }
-                if (!hasOldBlock) {
-                    cmd.CommandText = "ALTER TABLE blocklogs ADD COLUMN oldblockid INTEGER;";
-                    cmd.ExecuteNonQuery();
-                }
-
-                // Add actiontype column to containerlogs if it doesn't exist (for backwards compatibility)
-                cmd.CommandText = "PRAGMA table_info(containerlogs);";
-                bool hasActionType = false;
-                using (var reader = cmd.ExecuteReader()) {
-                    while (reader.Read()) {
-                        if (reader.GetString(1) == "actiontype") {
-                            hasActionType = true;
-                            break;
-                        }
-                    }
-                }
-                if (!hasActionType) {
-                    cmd.CommandText = "ALTER TABLE containerlogs ADD COLUMN actiontype TEXT DEFAULT 'TAKEN';";
-                    cmd.ExecuteNonQuery();
-                }
-
-                // Indices
-                // Perform Migration if needed
-                MigrateDatabase(connection);
 
                 cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_blocklogs_coords ON blocklogs(x, y, z);";
                 cmd.ExecuteNonQuery();
@@ -226,240 +190,6 @@ public class Database : IDisposable {
             catch (Exception ex) {
                 Main.API.Logger.Error("GriefWarden: Database worker encountered an error during shutdown: " + ex);
             }
-        }
-    }
-
-    private void MigrateDatabase(SqliteConnection connection) {
-        int currentVersion = 0;
-        using (var cmd = connection.CreateCommand()) {
-            cmd.CommandText = "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version';";
-            var result = cmd.ExecuteScalar();
-            if (result != null) {
-                cmd.CommandText = "SELECT version FROM schema_version LIMIT 1;";
-                var versionResult = cmd.ExecuteScalar();
-                if (versionResult != null && versionResult != DBNull.Value) {
-                    currentVersion = Convert.ToInt32(versionResult);
-                }
-            }
-        }
-
-        if (currentVersion >= 1) return;
-
-        Main.API.Logger.Notification("GriefWarden: Database migration started.");
-        long initialSize = new FileInfo(dbPath).Length;
-
-        using (var transaction = connection.BeginTransaction()) {
-            try {
-                using var cmd = connection.CreateCommand();
-                cmd.Transaction = transaction;
-
-                // Create new tables
-                cmd.CommandText = createSchemaVersionTable; cmd.ExecuteNonQuery();
-                cmd.CommandText = createPlayersTable; cmd.ExecuteNonQuery();
-
-                // Rename old tables
-                cmd.CommandText = "ALTER TABLE blocklogs RENAME TO old_blocklogs;"; cmd.ExecuteNonQuery();
-                cmd.CommandText = "ALTER TABLE entitylogs RENAME TO old_entitylogs;"; cmd.ExecuteNonQuery();
-                cmd.CommandText = "ALTER TABLE containerlogs RENAME TO old_containerlogs;"; cmd.ExecuteNonQuery();
-
-                // Create new schemas
-                cmd.CommandText = createBlockLogsTable; cmd.ExecuteNonQuery();
-                cmd.CommandText = createEntityLogsTable; cmd.ExecuteNonQuery();
-                cmd.CommandText = createContainerLogsTable; cmd.ExecuteNonQuery();
-
-                // Player caching for migration
-                var playerMap = new Dictionary<string, int>();
-
-                int GetOrInsertPlayer(string? playername, string? playeruid) {
-                    if (playername == null && playeruid == null) return -1;
-                    string key = playeruid ?? ("name:" + playername);
-                    if (playerMap.TryGetValue(key, out int id)) return id;
-
-                    using var pCmd = connection.CreateCommand();
-                    pCmd.Transaction = transaction;
-                    if (playeruid != null) {
-                        pCmd.CommandText = "INSERT OR IGNORE INTO players (playeruid, last_playername) VALUES ($uid, $name); SELECT id FROM players WHERE playeruid = $uid;";
-                        pCmd.Parameters.AddWithValue("$uid", playeruid);
-                        pCmd.Parameters.AddWithValue("$name", playername ?? (object)DBNull.Value);
-                    }
-                    else {
-                        pCmd.CommandText = "INSERT INTO players (last_playername) VALUES ($name); SELECT last_insert_rowid();";
-                        pCmd.Parameters.AddWithValue("$name", playername);
-                    }
-                    var pId = Convert.ToInt32(pCmd.ExecuteScalar());
-                    playerMap[key] = pId;
-                    return pId;
-                }
-
-                long ParseTimestamp(string? ts) {
-                    if (ts == null) return DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                    if (DateTime.TryParse(ts, out DateTime dt)) return new DateTimeOffset(dt, TimeSpan.Zero).ToUnixTimeSeconds();
-                    return DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                }
-
-                int migratedBlockLogs = 0;
-                cmd.CommandText = "SELECT id, timestamp, playername, playeruid, actiontype, block, itemstack, x, y, z FROM old_blocklogs;";
-                using (var reader = cmd.ExecuteReader()) {
-                    using var insertCmd = connection.CreateCommand();
-                    insertCmd.Transaction = transaction;
-                    insertCmd.CommandText = "INSERT INTO blocklogs (id, timestamp_utc, player_id, actiontype, block, itemstack_data, itemstack_encoding, x, y, z) VALUES ($id, $ts, $pid, $at, $b, $is_data, $is_enc, $x, $y, $z)";
-                    var pId = insertCmd.Parameters.Add("$id", SqliteType.Integer);
-                    var pTs = insertCmd.Parameters.Add("$ts", SqliteType.Integer);
-                    var pPid = insertCmd.Parameters.Add("$pid", SqliteType.Integer);
-                    var pAt = insertCmd.Parameters.Add("$at", SqliteType.Integer);
-                    var pB = insertCmd.Parameters.Add("$b", SqliteType.Text);
-                    var pIsData = insertCmd.Parameters.Add("$is_data", SqliteType.Blob);
-                    var pIsEnc = insertCmd.Parameters.Add("$is_enc", SqliteType.Integer);
-                    var pX = insertCmd.Parameters.Add("$x", SqliteType.Integer);
-                    var pY = insertCmd.Parameters.Add("$y", SqliteType.Integer);
-                    var pZ = insertCmd.Parameters.Add("$z", SqliteType.Integer);
-
-                    while (reader.Read()) {
-                        pId.Value = reader.GetInt64(0);
-                        pTs.Value = ParseTimestamp(reader.IsDBNull(1) ? null : reader.GetString(1));
-
-                        string? pname = reader.IsDBNull(2) ? null : reader.GetString(2);
-                        string? puid = reader.IsDBNull(3) ? null : reader.GetString(3);
-                        int playerId = GetOrInsertPlayer(pname, puid);
-                        pPid.Value = playerId == -1 ? DBNull.Value : playerId;
-
-                        string aTypeStr = reader.IsDBNull(4) ? "BROKE" : reader.GetString(4);
-                        pAt.Value = ActionTypeMap.TryGetValue(aTypeStr, out int val) ? val : 0;
-
-                        pB.Value = reader.IsDBNull(5) ? DBNull.Value : reader.GetString(5);
-
-                        var compressed = CompressText(reader.IsDBNull(6) ? null : reader.GetString(6));
-                        pIsData.Value = compressed.data ?? (object)DBNull.Value;
-                        pIsEnc.Value = compressed.encoding;
-
-                        pX.Value = reader.GetInt32(7);
-                        pY.Value = reader.GetInt32(8);
-                        pZ.Value = reader.GetInt32(9);
-
-                        insertCmd.ExecuteNonQuery();
-                        migratedBlockLogs++;
-                    }
-                }
-                Main.API.Logger.Notification($"GriefWarden: Migrated {migratedBlockLogs} block logs.");
-
-                int migratedEntityLogs = 0;
-                cmd.CommandText = "SELECT id, timestamp, playername, playeruid, actiontype, entityname, entityid, itemstack, x, y, z FROM old_entitylogs;";
-                using (var reader = cmd.ExecuteReader()) {
-                    using var insertCmd = connection.CreateCommand();
-                    insertCmd.Transaction = transaction;
-                    insertCmd.CommandText = "INSERT INTO entitylogs (id, timestamp_utc, player_id, actiontype, entityname, entityid, itemstack_data, itemstack_encoding, x, y, z) VALUES ($id, $ts, $pid, $at, $en, $eid, $is_data, $is_enc, $x, $y, $z)";
-                    var pId = insertCmd.Parameters.Add("$id", SqliteType.Integer);
-                    var pTs = insertCmd.Parameters.Add("$ts", SqliteType.Integer);
-                    var pPid = insertCmd.Parameters.Add("$pid", SqliteType.Integer);
-                    var pAt = insertCmd.Parameters.Add("$at", SqliteType.Integer);
-                    var pEn = insertCmd.Parameters.Add("$en", SqliteType.Text);
-                    var pEid = insertCmd.Parameters.Add("$eid", SqliteType.Text);
-                    var pIsData = insertCmd.Parameters.Add("$is_data", SqliteType.Blob);
-                    var pIsEnc = insertCmd.Parameters.Add("$is_enc", SqliteType.Integer);
-                    var pX = insertCmd.Parameters.Add("$x", SqliteType.Integer);
-                    var pY = insertCmd.Parameters.Add("$y", SqliteType.Integer);
-                    var pZ = insertCmd.Parameters.Add("$z", SqliteType.Integer);
-
-                    while (reader.Read()) {
-                        pId.Value = reader.GetInt64(0);
-                        pTs.Value = ParseTimestamp(reader.IsDBNull(1) ? null : reader.GetString(1));
-
-                        string? pname = reader.IsDBNull(2) ? null : reader.GetString(2);
-                        string? puid = reader.IsDBNull(3) ? null : reader.GetString(3);
-                        int playerId = GetOrInsertPlayer(pname, puid);
-                        pPid.Value = playerId == -1 ? DBNull.Value : playerId;
-
-                        string aTypeStr = reader.IsDBNull(4) ? "INTERACTED" : reader.GetString(4);
-                        pAt.Value = ActionTypeMap.TryGetValue(aTypeStr, out int val) ? val : 3;
-
-                        pEn.Value = reader.IsDBNull(5) ? DBNull.Value : reader.GetString(5);
-                        pEid.Value = reader.IsDBNull(6) ? DBNull.Value : reader.GetString(6);
-
-                        var compressed = CompressText(reader.IsDBNull(7) ? null : reader.GetString(7));
-                        pIsData.Value = compressed.data ?? (object)DBNull.Value;
-                        pIsEnc.Value = compressed.encoding;
-
-                        pX.Value = reader.GetInt32(8);
-                        pY.Value = reader.GetInt32(9);
-                        pZ.Value = reader.GetInt32(10);
-
-                        insertCmd.ExecuteNonQuery();
-                        migratedEntityLogs++;
-                    }
-                }
-                Main.API.Logger.Notification($"GriefWarden: Migrated {migratedEntityLogs} entity logs.");
-
-                int migratedContainerLogs = 0;
-                cmd.CommandText = "SELECT id, timestamp, playername, playeruid, containerid, itemstack, quantity, actiontype FROM old_containerlogs;";
-                using (var reader = cmd.ExecuteReader()) {
-                    using var insertCmd = connection.CreateCommand();
-                    insertCmd.Transaction = transaction;
-                    insertCmd.CommandText = "INSERT INTO containerlogs (id, timestamp_utc, player_id, containerid, itemstack_data, itemstack_encoding, quantity, actiontype) VALUES ($id, $ts, $pid, $cid, $is_data, $is_enc, $q, $at)";
-                    var pId = insertCmd.Parameters.Add("$id", SqliteType.Integer);
-                    var pTs = insertCmd.Parameters.Add("$ts", SqliteType.Integer);
-                    var pPid = insertCmd.Parameters.Add("$pid", SqliteType.Integer);
-                    var pCid = insertCmd.Parameters.Add("$cid", SqliteType.Text);
-                    var pIsData = insertCmd.Parameters.Add("$is_data", SqliteType.Blob);
-                    var pIsEnc = insertCmd.Parameters.Add("$is_enc", SqliteType.Integer);
-                    var pQ = insertCmd.Parameters.Add("$q", SqliteType.Integer);
-                    var pAt = insertCmd.Parameters.Add("$at", SqliteType.Integer);
-
-                    while (reader.Read()) {
-                        pId.Value = reader.GetInt64(0);
-                        pTs.Value = ParseTimestamp(reader.IsDBNull(1) ? null : reader.GetString(1));
-
-                        string? pname = reader.IsDBNull(2) ? null : reader.GetString(2);
-                        string? puid = reader.IsDBNull(3) ? null : reader.GetString(3);
-                        int playerId = GetOrInsertPlayer(pname, puid);
-                        pPid.Value = playerId == -1 ? DBNull.Value : playerId;
-
-                        pCid.Value = reader.IsDBNull(4) ? DBNull.Value : reader.GetString(4);
-
-                        var compressed = CompressText(reader.IsDBNull(5) ? null : reader.GetString(5));
-                        pIsData.Value = compressed.data ?? (object)DBNull.Value;
-                        pIsEnc.Value = compressed.encoding;
-
-                        pQ.Value = reader.GetInt32(6);
-
-                        string aTypeStr = reader.IsDBNull(7) ? "TAKEN" : reader.GetString(7);
-                        pAt.Value = ActionTypeMap.TryGetValue(aTypeStr, out int val) ? val : 5;
-
-                        insertCmd.ExecuteNonQuery();
-                        migratedContainerLogs++;
-                    }
-                }
-                Main.API.Logger.Notification($"GriefWarden: Migrated {migratedContainerLogs} container logs.");
-
-                cmd.CommandText = "DROP TABLE old_blocklogs;"; cmd.ExecuteNonQuery();
-                cmd.CommandText = "DROP TABLE old_entitylogs;"; cmd.ExecuteNonQuery();
-                cmd.CommandText = "DROP TABLE old_containerlogs;"; cmd.ExecuteNonQuery();
-
-                cmd.CommandText = "INSERT INTO schema_version (version) VALUES (1);";
-                cmd.ExecuteNonQuery();
-
-                transaction.Commit();
-
-            }
-            catch (Exception e) {
-                transaction.Rollback();
-                Main.API.Logger.Error("GriefWarden: Migration failed, rolling back.");
-                Main.API.Logger.Error(e.ToString());
-                return; // Stop if transaction failed
-            }
-        }
-
-        try {
-            using (var pragmaCmd = connection.CreateCommand()) {
-                pragmaCmd.CommandText = "VACUUM;";
-                pragmaCmd.ExecuteNonQuery();
-            }
-
-            long finalSize = new FileInfo(dbPath).Length;
-            Main.API.Logger.Notification($"GriefWarden: Database migration finished successfully. Size before: {initialSize / 1024.0 / 1024.0:F2} MB, after: {finalSize / 1024.0 / 1024.0:F2} MB.");
-        }
-        catch (Exception e) {
-            Main.API.Logger.Error("GriefWarden: Migration succeeded, but VACUUM failed.");
-            Main.API.Logger.Error(e.ToString());
         }
     }
 
