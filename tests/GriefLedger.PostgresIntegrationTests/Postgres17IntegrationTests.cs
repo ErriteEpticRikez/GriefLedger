@@ -106,6 +106,7 @@ public sealed class Postgres17IntegrationTests {
             ExerciseWritesCompressionFailureAndDrain();
             ExerciseFinalPlayerNameUpdate();
             await ExerciseLedgerWriterAndCutoff(admin, schema);
+            await ExerciseExactLedgerReaders(admin, schema);
 
             using (var database = new Database()) {
                 Assert.Equal((606, 70, -606), database.GetLastEntityCoordsLog("page-target"));
@@ -400,11 +401,14 @@ public sealed class Postgres17IntegrationTests {
             "idx_entitylogs_ts", "idx_entitylogs_pid_ts", "idx_entitylogs_act_ts",
             "idx_containerlogs_ts", "idx_containerlogs_pid_ts", "idx_containerlogs_act_ts",
             "idx_blockmutationlogs_player_dimension_id_desc",
+            "idx_blockmutationlogs_replay_candidates",
             "idx_blockmutationlogs_dimension_coords_id_desc",
             "idx_blockmutationlogs_source_outcome", "ux_blockmutationlogs_successful_source"
         ];
         Assert.All(expected, name => Assert.True(names.ContainsKey(name)));
         Assert.Contains("(player_id, dimension, id DESC)", names["idx_blockmutationlogs_player_dimension_id_desc"], StringComparison.Ordinal);
+        Assert.Contains("(player_id, dimension, action_kind, x, y, z, id DESC)", names["idx_blockmutationlogs_replay_candidates"], StringComparison.Ordinal);
+        Assert.Contains("WHERE (entry_kind = 0)", names["idx_blockmutationlogs_replay_candidates"], StringComparison.Ordinal);
         Assert.Contains("(dimension, x, y, z, id DESC)", names["idx_blockmutationlogs_dimension_coords_id_desc"], StringComparison.Ordinal);
         Assert.Contains("(source_mutation_id, rollback_outcome)", names["idx_blockmutationlogs_source_outcome"], StringComparison.Ordinal);
         Assert.StartsWith("CREATE UNIQUE INDEX", names["ux_blockmutationlogs_successful_source"], StringComparison.Ordinal);
@@ -420,6 +424,7 @@ public sealed class Postgres17IntegrationTests {
 
     private static async Task ExerciseLedgerWriterAndCutoff(NpgsqlDataSource admin, string schema) {
         var envelope = new BlockStateEnvelope(EnvelopeBlockState.Asset("game:stone"), EnvelopeBlockState.Air());
+        var inverse = new BlockStateEnvelope(envelope.After, envelope.Before);
         using var database = new Database();
         Task<long> first = database.EnqueueBlockMutationAppend(MutationAppend(envelope, 100));
         Task<long> second = database.EnqueueBlockMutationAppend(MutationAppend(envelope, 101));
@@ -478,10 +483,12 @@ public sealed class Postgres17IntegrationTests {
             Assert.Equal(2L, Convert.ToInt64(await prefixCheck.ExecuteScalarAsync()));
         }
 
+        await AssertBogusRollbackInversesAreAtomic(admin, schema, firstId, envelope);
+
         var rollback = new BlockMutationAppend(
             DateTimeOffset.UtcNow.ToUnixTimeSeconds(), null, null,
             BlockMutationEntryKind.Rollback, BlockMutationActionKind.Rollback,
-            2, 100, 80, -100, envelope, firstId, BlockMutationRollbackOutcome.Succeeded,
+            2, 100, 80, -100, inverse, firstId, BlockMutationRollbackOutcome.Succeeded,
             operatorPlayerName: "Operator", operatorPlayerUid: "operator-uid"
         );
         long rollbackId = await database.EnqueueBlockMutationAppend(rollback);
@@ -490,7 +497,7 @@ public sealed class Postgres17IntegrationTests {
         var duplicateRollback = new BlockMutationAppend(
             DateTimeOffset.UtcNow.ToUnixTimeSeconds(), null, null,
             BlockMutationEntryKind.Rollback, BlockMutationActionKind.Rollback,
-            2, 100, 80, -100, envelope, firstId, BlockMutationRollbackOutcome.Succeeded,
+            2, 100, 80, -100, inverse, firstId, BlockMutationRollbackOutcome.Succeeded,
             operatorPlayerName: "Failed Operator", operatorPlayerUid: "operator-failed-atomic"
         );
         Task<long> duplicate = database.EnqueueBlockMutationAppend(duplicateRollback);
@@ -510,7 +517,7 @@ public sealed class Postgres17IntegrationTests {
         var coordinateMismatch = new BlockMutationAppend(
             DateTimeOffset.UtcNow.ToUnixTimeSeconds(), null, null,
             BlockMutationEntryKind.Rollback, BlockMutationActionKind.Rollback,
-            2, 999, 80, -100, envelope, firstId, BlockMutationRollbackOutcome.Skipped,
+            2, 999, 80, -100, inverse, firstId, BlockMutationRollbackOutcome.Skipped,
             "coordinate-mismatch", operatorPlayerUid: "operator-coordinate-check"
         );
         await Assert.ThrowsAsync<InvalidOperationException>(async () => await database.EnqueueBlockMutationAppend(coordinateMismatch));
@@ -546,6 +553,189 @@ public sealed class Postgres17IntegrationTests {
         shutdownDatabase.Dispose();
         Assert.True(await drainedAppend > rollbackId);
         await Assert.ThrowsAsync<ObjectDisposedException>(async () => await shutdownDatabase.GetDurableMutationCutoffAsync());
+    }
+
+    private static async Task AssertBogusRollbackInversesAreAtomic(NpgsqlDataSource admin, string schema,
+        long sourceId, BlockStateEnvelope nonInverse) {
+        BlockMutationRollbackOutcome[] outcomes = [
+            BlockMutationRollbackOutcome.Succeeded,
+            BlockMutationRollbackOutcome.Failed,
+            BlockMutationRollbackOutcome.Skipped
+        ];
+        foreach (BlockMutationRollbackOutcome outcome in outcomes) {
+            string operatorUid = "operator-bogus-inverse-" + outcome.ToString().ToLowerInvariant();
+            using (var rejectingDatabase = new Database()) {
+                var bogus = new BlockMutationAppend(
+                    DateTimeOffset.UtcNow.ToUnixTimeSeconds(), null, null,
+                    BlockMutationEntryKind.Rollback, BlockMutationActionKind.Rollback,
+                    2, 100, 80, -100, nonInverse, sourceId, outcome,
+                    outcome == BlockMutationRollbackOutcome.Succeeded ? null : "bogus-inverse",
+                    "Bogus Operator", operatorUid);
+                await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+                    await rejectingDatabase.EnqueueBlockMutationAppend(bogus));
+            }
+
+            await using NpgsqlConnection connection = await admin.OpenConnectionAsync();
+            await using NpgsqlCommand command = connection.CreateCommand();
+            command.CommandText = $@"SET search_path TO {QuoteIdentifier(schema)};
+                SELECT (SELECT count(*) FROM players WHERE playeruid = @operator_uid),
+                       (SELECT count(*) FROM blockmutationlogs rollback_row
+                         JOIN players operator_row ON operator_row.id = rollback_row.operator_player_id
+                        WHERE operator_row.playeruid = @operator_uid);";
+            command.Parameters.AddWithValue("operator_uid", operatorUid);
+            await using NpgsqlDataReader reader = await command.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+            Assert.Equal(0L, reader.GetInt64(0));
+            Assert.Equal(0L, reader.GetInt64(1));
+        }
+    }
+
+    private static async Task ExerciseExactLedgerReaders(NpgsqlDataSource admin, string schema) {
+        EnvelopeBlockState stone = EnvelopeBlockState.Asset("game:reader-stone");
+        EnvelopeBlockState brick = EnvelopeBlockState.Asset("game:reader-brick");
+        EnvelopeBlockState air = EnvelopeBlockState.Air();
+        var broke = new BlockStateEnvelope(stone, air);
+        var placed = new BlockStateEnvelope(air, brick);
+        using var database = new Database();
+
+        long breakId = await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1000, "Reader Target", "reader-target", BlockMutationEntryKind.Mutation,
+            BlockMutationActionKind.Break, 9, 400, 50, -400, broke));
+        long placeId = await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1001, "Reader Target", "reader-target", BlockMutationEntryKind.Mutation,
+            BlockMutationActionKind.Place, 9, 400, 50, -400, placed));
+        long otherId = await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1002, "Reader Other", "reader-other", BlockMutationEntryKind.Mutation,
+            BlockMutationActionKind.Place, 9, 400, 50, -400, new BlockStateEnvelope(brick, stone)));
+        await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1003, "Shared Reader", "reader-shared-a", BlockMutationEntryKind.Mutation,
+            BlockMutationActionKind.Break, 9, 600, 50, -600, broke));
+        await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1004, "Shared Reader", "reader-shared-b", BlockMutationEntryKind.Mutation,
+            BlockMutationActionKind.Break, 9, 601, 50, -601, broke));
+        long failureId = await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1005, null, null, BlockMutationEntryKind.Rollback, BlockMutationActionKind.Rollback,
+            9, 400, 50, -400, new BlockStateEnvelope(air, stone), breakId,
+            BlockMutationRollbackOutcome.Failed, "restore-failed", "Reader Operator", "reader-operator"));
+        long cutoff = await database.GetDurableBlockMutationCutoffAsync();
+
+        BlockMutationPlayer player = Assert.IsType<BlockMutationPlayer>(
+            await database.ResolveBlockMutationPlayerByUidAsync("reader-target"));
+        Assert.True(player.Id > int.MaxValue);
+        Assert.Equal("Reader Target", player.LastPlayerName);
+        Assert.Null(await database.ResolveBlockMutationPlayerByUidAsync("missing-reader"));
+        BlockMutationPlayerNameResolution unique = await database.ResolveBlockMutationPlayerByNameAsync("reader target");
+        Assert.Equal(BlockMutationPlayerNameResolutionKind.Unique, unique.Kind);
+        Assert.Equal("reader-target", unique.Player!.PlayerUid);
+        BlockMutationPlayerNameResolution ambiguous = await database.ResolveBlockMutationPlayerByNameAsync("SHARED READER");
+        Assert.Equal(BlockMutationPlayerNameResolutionKind.Ambiguous, ambiguous.Kind);
+        Assert.Equal(2, ambiguous.Matches.Count);
+
+        IReadOnlyList<BlockMutationLogRow> breaks = await database.ReadTargetBlockMutationsAsync(new BlockMutationTargetQuery {
+            PlayerUid = "reader-target", Dimension = 9, CenterX = 400, CenterY = 50, CenterZ = -400,
+            Radius = 0, BreakOnly = true, CutoffId = cutoff
+        });
+        Assert.Equal([breakId], breaks.Select(row => row.Id));
+        IReadOnlyList<BlockMutationLogRow> all = await database.ReadTargetBlockMutationsAsync(new BlockMutationTargetQuery {
+            PlayerId = player.Id, Dimension = 9, CenterX = 400, CenterY = 50, CenterZ = -400,
+            Radius = 0, BreakOnly = false, CutoffId = cutoff
+        });
+        Assert.Equal([placeId, breakId], all.Select(row => row.Id));
+        Assert.All(all, row => Assert.Equal("reader-target", row.ActorPlayerUid));
+
+        IReadOnlyList<BlockMutationLogRow> history = await database.ReadBlockMutationHistoryAsync(new BlockMutationHistoryQuery {
+            Coordinates = [new BlockMutationCoordinate(9, 400, 50, -400)], MaximumId = cutoff
+        });
+        Assert.Equal([failureId, otherId, placeId, breakId], history.Select(row => row.Id));
+        BlockMutationLogRow rollback = history[0];
+        Assert.Null(rollback.ActorPlayerId);
+        Assert.Equal("reader-operator", rollback.OperatorPlayerUid);
+        Assert.True(rollback.OperatorPlayerId > int.MaxValue);
+        Assert.Equal(new BlockStateEnvelope(air, stone), rollback.Envelope);
+
+        await using (NpgsqlConnection connection = await admin.OpenConnectionAsync()) {
+            await using NpgsqlCommand explain = connection.CreateCommand();
+            explain.CommandText = $@"SET search_path TO {QuoteIdentifier(schema)};
+                SET LOCAL enable_seqscan = off;
+                EXPLAIN SELECT id FROM blockmutationlogs
+                 WHERE entry_kind = 0 AND player_id = @player_id AND dimension = 9
+                   AND action_kind = 1 AND x BETWEEN 399 AND 401 AND y BETWEEN 49 AND 51
+                   AND z BETWEEN -401 AND -399 AND id <= @cutoff;
+                EXPLAIN SELECT id FROM blockmutationlogs
+                 WHERE dimension = 9 AND x = 400 AND y = 50 AND z = -400 AND id <= @cutoff;";
+            explain.Parameters.AddWithValue("player_id", NpgsqlDbType.Bigint, player.Id);
+            explain.Parameters.AddWithValue("cutoff", NpgsqlDbType.Bigint, cutoff);
+            await using NpgsqlDataReader reader = await explain.ExecuteReaderAsync();
+            string candidatePlan = await ReadPlan(reader);
+            Assert.Contains("idx_blockmutationlogs_replay_candidates", candidatePlan, StringComparison.Ordinal);
+            Assert.True(await reader.NextResultAsync());
+            string historyPlan = await ReadPlan(reader);
+            Assert.Contains("idx_blockmutationlogs_dimension_coords_id_desc", historyPlan, StringComparison.Ordinal);
+        }
+
+        long malformedId = await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1006, "Malformed Reader", "reader-malformed", BlockMutationEntryKind.Mutation,
+            BlockMutationActionKind.Break, 9, 777, 50, -777, broke));
+        await using (NpgsqlConnection connection = await admin.OpenConnectionAsync()) {
+            await using NpgsqlCommand corrupt = connection.CreateCommand();
+            corrupt.CommandText = $"SET search_path TO {QuoteIdentifier(schema)}; UPDATE blockmutationlogs SET envelope_data = decode('00', 'hex') WHERE id = @id;";
+            corrupt.Parameters.AddWithValue("id", malformedId);
+            Assert.Equal(1, await corrupt.ExecuteNonQueryAsync());
+        }
+        await Assert.ThrowsAsync<InvalidDataException>(async () => await database.ReadBlockMutationHistoryAsync(
+            new BlockMutationHistoryQuery {
+                Coordinates = [new BlockMutationCoordinate(9, 777, 50, -777)], MaximumId = malformedId
+            }));
+
+        long boundedMaximumId;
+        long overLimitMaximumId;
+        await using (NpgsqlConnection connection = await admin.OpenConnectionAsync()) {
+            await using NpgsqlCommand bulk = connection.CreateCommand();
+            bulk.CommandText = $@"SET search_path TO {QuoteIdentifier(schema)};
+                WITH inserted AS (
+                    INSERT INTO blockmutationlogs
+                        (timestamp_utc, player_id, entry_kind, action_kind, dimension, x, y, z,
+                         envelope_data, envelope_encoding)
+                    SELECT 2000 + generated.value, @player_id, 0, 1, 12, 900, 60, -900,
+                           @envelope, 1
+                    FROM generate_series(1, @row_count) AS generated(value)
+                    RETURNING id
+                )
+                SELECT min(id), max(id) FROM inserted;";
+            bulk.Parameters.AddWithValue("player_id", NpgsqlDbType.Bigint, player.Id);
+            bulk.Parameters.AddWithValue("envelope", NpgsqlDbType.Bytea, broke.Encode());
+            bulk.Parameters.AddWithValue("row_count", NpgsqlDbType.Integer,
+                BlockRollbackLimits.MaximumCandidates + 1);
+            await using NpgsqlDataReader reader = await bulk.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+            long minimumId = reader.GetInt64(0);
+            overLimitMaximumId = reader.GetInt64(1);
+            boundedMaximumId = minimumId + BlockRollbackLimits.MaximumCandidates - 1;
+            Assert.Equal(BlockRollbackLimits.MaximumCandidates, boundedMaximumId - minimumId + 1);
+        }
+        var boundedQuery = new BlockMutationTargetQuery {
+            PlayerId = player.Id, Dimension = 12, CenterX = 900, CenterY = 60, CenterZ = -900,
+            Radius = 0, BreakOnly = true, CutoffId = boundedMaximumId
+        };
+        Assert.Equal(BlockRollbackLimits.MaximumCandidates,
+            (await database.ReadTargetBlockMutationsAsync(boundedQuery)).Count);
+        await Assert.ThrowsAsync<BlockRollbackLimitExceededException>(async () =>
+            await database.ReadTargetBlockMutationsAsync(boundedQuery with { CutoffId = overLimitMaximumId }));
+
+        var disposedReader = new Database();
+        disposedReader.Dispose();
+        await Assert.ThrowsAsync<ObjectDisposedException>(async () =>
+            await disposedReader.ResolveBlockMutationPlayerByUidAsync("reader-target"));
+        await Assert.ThrowsAsync<ObjectDisposedException>(async () =>
+            await disposedReader.ReadBlockMutationHistoryAsync(new BlockMutationHistoryQuery {
+                Coordinates = Array.Empty<BlockMutationCoordinate>(), MaximumId = cutoff
+            }));
+    }
+
+    private static async Task<string> ReadPlan(NpgsqlDataReader reader) {
+        var lines = new List<string>();
+        while (await reader.ReadAsync()) lines.Add(reader.GetString(0));
+        return string.Join('\n', lines);
     }
 
     private static BlockMutationAppend MutationAppend(BlockStateEnvelope envelope, int x) => new(

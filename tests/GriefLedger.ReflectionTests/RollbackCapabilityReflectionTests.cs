@@ -357,6 +357,22 @@ public sealed class RollbackCapabilityReflectionTests {
             Assert.Equal(position.Z, decoded.GetInt("posz"));
             Assert.Equal(assetCode, decoded.GetString("blockCode"));
             Assert.Equal(new[] { material.Id }, BlockEntityMicroBlock.MaterialIdsFromAttributes(decoded, world));
+
+            Assert.True(MicroblockTreeCodec.TryPrepareRestore(first, world, position, assetCode, out TreeAttribute restoreTree));
+            Assert.IsType<StringArrayAttribute>(restoreTree["materials"]);
+            BlockEntityMicroBlock restored = entity is BlockEntityChisel ? new BlockEntityChisel() : new BlockEntityMicroBlock();
+            restored.Block = entity.Block;
+            restored.Pos = position.Copy();
+            ICoreAPI core = Proxy<ICoreAPI>((method, _) => method.Name switch {
+                "get_World" => world,
+                "get_Side" => EnumAppSide.Server,
+                _ => Default(method.ReturnType)
+            });
+            restored.Initialize(core);
+            restored.FromTreeAttributes(restoreTree, world);
+            restored.HistoryStateRestore();
+            Assert.Equal(new[] { material.Id }, restored.BlockIds);
+            Assert.Equal(entity.VoxelCuboids, restored.VoxelCuboids);
         }
     }
 
@@ -425,7 +441,16 @@ public sealed class RollbackCapabilityReflectionTests {
     }
 
     private static IWorldAccessor MaterialRegistryWorld(Block material) {
+        IBlockAccessor blockAccessor = Proxy<IBlockAccessor>((method, arguments) => {
+            if (method.Name == nameof(IBlockAccessor.GetBlock) && arguments?.Length == 1) {
+                return arguments[0] is int id && id == material.Id ? material : null;
+            }
+            return Default(method.ReturnType);
+        });
         return Proxy<IWorldAccessor>((method, arguments) => {
+            if (method.Name == "get_Side") return EnumAppSide.Server;
+            if (method.Name == "get_Blocks") return Enumerable.Repeat(material, material.Id + 1).ToArray();
+            if (method.Name == "get_BlockAccessor") return blockAccessor;
             if (method.Name != nameof(IWorldAccessor.GetBlock) || arguments?.Length != 1) return Default(method.ReturnType);
             return arguments[0] switch {
                 int id when id == material.Id => material,

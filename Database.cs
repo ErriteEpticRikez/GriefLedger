@@ -3,6 +3,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using GriefLedger.Rollback;
@@ -289,6 +290,8 @@ public class Database : IDisposable {
 
                     cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_blockmutationlogs_player_dimension_id_desc ON blockmutationlogs(player_id, dimension, id DESC);";
                     cmd.ExecuteNonQuery();
+                    cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_blockmutationlogs_replay_candidates ON blockmutationlogs(player_id, dimension, action_kind, x, y, z, id DESC) WHERE entry_kind = 0;";
+                    cmd.ExecuteNonQuery();
                     cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_blockmutationlogs_dimension_coords_id_desc ON blockmutationlogs(dimension, x, y, z, id DESC);";
                     cmd.ExecuteNonQuery();
                     cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_blockmutationlogs_source_outcome ON blockmutationlogs(source_mutation_id, rollback_outcome);";
@@ -488,6 +491,7 @@ public class Database : IDisposable {
 
     private static void ValidateBlockMutationIndexes(NpgsqlConnection connection, NpgsqlTransaction transaction) {
         ValidateBlockMutationIndex(connection, transaction, "idx_blockmutationlogs_player_dimension_id_desc", ["player_id", "dimension", "id"], [0, 0, 3], false, null);
+        ValidateBlockMutationIndex(connection, transaction, "idx_blockmutationlogs_replay_candidates", ["player_id", "dimension", "action_kind", "x", "y", "z", "id"], [0, 0, 0, 0, 0, 0, 3], false, "(entry_kind = 0)");
         ValidateBlockMutationIndex(connection, transaction, "idx_blockmutationlogs_dimension_coords_id_desc", ["dimension", "x", "y", "z", "id"], [0, 0, 0, 0, 3], false, null);
         ValidateBlockMutationIndex(connection, transaction, "idx_blockmutationlogs_source_outcome", ["source_mutation_id", "rollback_outcome"], [0, 0], false, null);
         ValidateBlockMutationIndex(connection, transaction, "ux_blockmutationlogs_successful_source", ["source_mutation_id"], [0], true, "((entry_kind = 1) AND (rollback_outcome = 1))");
@@ -685,6 +689,31 @@ public class Database : IDisposable {
         }
     }
 
+    private Task<T> QueueReadAsync<T>(string operation, System.Func<NpgsqlConnection, CancellationToken, Task<T>> read,
+        CancellationToken cancellationToken) {
+        ArgumentNullException.ThrowIfNull(read);
+        if (!TryBeginRead(operation)) {
+            return Task.FromException<T>(new ObjectDisposedException(nameof(Database), "The database is shutting down."));
+        }
+
+        try {
+            return Task.Run(async () => {
+                try {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    await using NpgsqlConnection connection = await dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+                    return await read(connection, cancellationToken).ConfigureAwait(false);
+                }
+                finally {
+                    EndRead();
+                }
+            }, CancellationToken.None);
+        }
+        catch (Exception exception) {
+            EndRead();
+            return Task.FromException<T>(exception);
+        }
+    }
+
     private static void AddParameter(NpgsqlCommand cmd, string name, NpgsqlDbType type, object? value) {
         cmd.Parameters.Add(new NpgsqlParameter(name, type) { Value = value ?? DBNull.Value });
     }
@@ -749,7 +778,8 @@ public class Database : IDisposable {
             if (append.EntryKind == BlockMutationEntryKind.Rollback) {
                 using var sourceCmd = connection.CreateCommand();
                 sourceCmd.Transaction = transaction;
-                sourceCmd.CommandText = @"SELECT entry_kind, dimension, x, y, z
+                sourceCmd.CommandText = @"SELECT entry_kind, action_kind, dimension, x, y, z,
+                        envelope_data, envelope_encoding
                     FROM blockmutationlogs
                     WHERE id = @source_mutation_id
                     FOR SHARE;";
@@ -759,9 +789,24 @@ public class Database : IDisposable {
                     if (sourceReader.GetInt32(0) != (int)BlockMutationEntryKind.Mutation) {
                         throw new InvalidOperationException("A rollback source must be a mutation entry.");
                     }
-                    if (sourceReader.GetInt32(1) != append.Dimension || sourceReader.GetInt32(2) != append.X
-                        || sourceReader.GetInt32(3) != append.Y || sourceReader.GetInt32(4) != append.Z) {
+                    BlockMutationActionKind sourceAction = (BlockMutationActionKind)sourceReader.GetInt32(1);
+                    if (!Enum.IsDefined(sourceAction) || sourceAction is BlockMutationActionKind.Unknown or BlockMutationActionKind.Rollback) {
+                        throw new InvalidOperationException("A rollback source must use a supported mutation action.");
+                    }
+                    if (sourceReader.GetInt32(2) != append.Dimension || sourceReader.GetInt32(3) != append.X
+                        || sourceReader.GetInt32(4) != append.Y || sourceReader.GetInt32(5) != append.Z) {
                         throw new InvalidOperationException("A rollback entry must use the source mutation's dimension and absolute coordinates.");
+                    }
+                    int sourceEncoding = sourceReader.GetInt32(7);
+                    if (sourceEncoding != BlockStateEnvelope.BinaryEncoding) {
+                        throw new InvalidOperationException("The rollback source uses an unsupported envelope encoding.");
+                    }
+                    BlockStateEnvelope sourceEnvelope = BlockStateEnvelope.Decode(sourceReader.GetFieldValue<byte[]>(6));
+                    var exactInverse = new BlockStateEnvelope(sourceEnvelope.After, sourceEnvelope.Before);
+                    byte[] expectedInverseBytes = exactInverse.Encode();
+                    if (!append.DecodeEnvelope().Equals(exactInverse)
+                        || !envelope.AsSpan().SequenceEqual(expectedInverseBytes)) {
+                        throw new InvalidOperationException("A rollback entry must store the exact inverse of its source mutation envelope.");
                     }
                 }
             }
@@ -822,6 +867,171 @@ public class Database : IDisposable {
     }
 
     public Task<long> GetDurableMutationCutoffAsync() => GetDurableBlockMutationCutoffAsync();
+
+    /// <summary>Resolves an immutable UID exactly. World/player APIs are never touched by this read.</summary>
+    public Task<BlockMutationPlayer?> ResolveBlockMutationPlayerByUidAsync(string playerUid,
+        CancellationToken cancellationToken = default) {
+        if (string.IsNullOrWhiteSpace(playerUid)) throw new ArgumentException("A nonempty immutable player UID is required.", nameof(playerUid));
+        return QueueReadAsync("resolve exact-ledger player UID", async (connection, token) => {
+            await using NpgsqlCommand cmd = connection.CreateCommand();
+            cmd.CommandText = @"SELECT id, playeruid, last_playername
+                FROM players
+                WHERE playeruid = @player_uid
+                ORDER BY id
+                LIMIT 2;";
+            AddParameter(cmd, "@player_uid", NpgsqlDbType.Text, playerUid);
+            await using NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(token).ConfigureAwait(false);
+            BlockMutationPlayer? player = null;
+            if (await reader.ReadAsync(token).ConfigureAwait(false)) {
+                player = ReadPlayer(reader);
+            }
+            if (await reader.ReadAsync(token).ConfigureAwait(false)) {
+                throw new InvalidOperationException("The immutable player UID is not unique in the players table.");
+            }
+            return player;
+        }, cancellationToken);
+    }
+
+    /// <summary>Resolves a case-insensitive last-known name only when it identifies one player row.</summary>
+    public Task<BlockMutationPlayerNameResolution> ResolveBlockMutationPlayerByNameAsync(string playerName,
+        CancellationToken cancellationToken = default) {
+        if (string.IsNullOrWhiteSpace(playerName)) throw new ArgumentException("A nonempty player name is required.", nameof(playerName));
+        return QueueReadAsync("resolve exact-ledger player name", async (connection, token) => {
+            await using NpgsqlCommand cmd = connection.CreateCommand();
+            cmd.CommandText = @"SELECT id, playeruid, last_playername
+                FROM players
+                WHERE lower(last_playername) = lower(@player_name)
+                ORDER BY id;";
+            AddParameter(cmd, "@player_name", NpgsqlDbType.Text, playerName);
+            var players = new List<BlockMutationPlayer>();
+            await using NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(token).ConfigureAwait(false);
+            while (await reader.ReadAsync(token).ConfigureAwait(false)) players.Add(ReadPlayer(reader));
+            return new BlockMutationPlayerNameResolution(players.AsReadOnly());
+        }, cancellationToken);
+    }
+
+    /// <summary>Selects target mutations from the exact ledger in strict newest-first order.</summary>
+    public Task<IReadOnlyList<BlockMutationLogRow>> ReadTargetBlockMutationsAsync(BlockMutationTargetQuery query,
+        CancellationToken cancellationToken = default) {
+        ArgumentNullException.ThrowIfNull(query);
+        query.Validate();
+        int minimumX = ClampCoordinate((long)query.CenterX - query.Radius);
+        int maximumX = ClampCoordinate((long)query.CenterX + query.Radius);
+        int minimumY = ClampCoordinate((long)query.CenterY - query.Radius);
+        int maximumY = ClampCoordinate((long)query.CenterY + query.Radius);
+        int minimumZ = ClampCoordinate((long)query.CenterZ - query.Radius);
+        int maximumZ = ClampCoordinate((long)query.CenterZ + query.Radius);
+
+        return QueueReadAsync("read exact-ledger rollback candidates", async (connection, token) => {
+            await using NpgsqlCommand cmd = connection.CreateCommand();
+            cmd.CommandText = @"SELECT l.id, l.timestamp_utc, l.player_id, l.entry_kind, l.action_kind,
+                    l.dimension, l.x, l.y, l.z, l.envelope_data, l.envelope_encoding,
+                    l.source_mutation_id, l.rollback_outcome, l.failure_code, l.operator_player_id,
+                    actor.playeruid, actor.last_playername, operator_player.playeruid, operator_player.last_playername
+                FROM blockmutationlogs l
+                LEFT JOIN players actor ON actor.id = l.player_id
+                LEFT JOIN players operator_player ON operator_player.id = l.operator_player_id
+                WHERE l.entry_kind = 0
+                  AND ((@player_id IS NOT NULL AND l.player_id = @player_id)
+                       OR (@player_uid IS NOT NULL AND actor.playeruid = @player_uid))
+                  AND l.dimension = @dimension
+                  AND l.x BETWEEN @minimum_x AND @maximum_x
+                  AND l.y BETWEEN @minimum_y AND @maximum_y
+                  AND l.z BETWEEN @minimum_z AND @maximum_z
+                  AND l.id <= @cutoff_id
+                  AND ((@break_only AND l.action_kind = 1)
+                       OR (NOT @break_only AND l.action_kind IN (1, 2, 3, 4)))
+                ORDER BY l.id DESC
+                LIMIT @row_limit;";
+            AddParameter(cmd, "@player_id", NpgsqlDbType.Bigint, query.PlayerId);
+            AddParameter(cmd, "@player_uid", NpgsqlDbType.Text, string.IsNullOrWhiteSpace(query.PlayerUid) ? null : query.PlayerUid);
+            AddParameter(cmd, "@dimension", NpgsqlDbType.Integer, query.Dimension);
+            AddParameter(cmd, "@minimum_x", NpgsqlDbType.Integer, minimumX);
+            AddParameter(cmd, "@maximum_x", NpgsqlDbType.Integer, maximumX);
+            AddParameter(cmd, "@minimum_y", NpgsqlDbType.Integer, minimumY);
+            AddParameter(cmd, "@maximum_y", NpgsqlDbType.Integer, maximumY);
+            AddParameter(cmd, "@minimum_z", NpgsqlDbType.Integer, minimumZ);
+            AddParameter(cmd, "@maximum_z", NpgsqlDbType.Integer, maximumZ);
+            AddParameter(cmd, "@cutoff_id", NpgsqlDbType.Bigint, query.CutoffId);
+            AddParameter(cmd, "@break_only", NpgsqlDbType.Boolean, query.BreakOnly);
+            AddParameter(cmd, "@row_limit", NpgsqlDbType.Integer, BlockRollbackLimits.MaximumCandidates + 1);
+            return await ReadBlockMutationRowsAsync(cmd, token, BlockRollbackLimits.MaximumCandidates,
+                "candidate count").ConfigureAwait(false);
+        }, cancellationToken);
+    }
+
+    /// <summary>Loads every mutation and rollback outcome for the exact candidate coordinates.</summary>
+    public Task<IReadOnlyList<BlockMutationLogRow>> ReadBlockMutationHistoryAsync(BlockMutationHistoryQuery query,
+        CancellationToken cancellationToken = default) {
+        ArgumentNullException.ThrowIfNull(query);
+        query.Validate();
+        BlockMutationCoordinate[] coordinates = query.Coordinates.Distinct().OrderBy(value => value.Dimension)
+            .ThenBy(value => value.X).ThenBy(value => value.Y).ThenBy(value => value.Z).ToArray();
+        if (coordinates.Length > BlockRollbackLimits.MaximumUniqueCoordinates) {
+            throw new BlockRollbackLimitExceededException("unique coordinate count", BlockRollbackLimits.MaximumUniqueCoordinates);
+        }
+        if (coordinates.Length == 0) {
+            return QueueReadAsync("read empty exact-ledger coordinate history",
+                (_, token) => {
+                    token.ThrowIfCancellationRequested();
+                    return Task.FromResult<IReadOnlyList<BlockMutationLogRow>>(Array.Empty<BlockMutationLogRow>());
+                }, cancellationToken);
+        }
+
+        return QueueReadAsync("read exact-ledger coordinate history", async (connection, token) => {
+            await using NpgsqlCommand cmd = connection.CreateCommand();
+            cmd.CommandText = @"WITH requested(dimension, x, y, z) AS (
+                    SELECT * FROM unnest(@dimensions, @xs, @ys, @zs)
+                )
+                SELECT l.id, l.timestamp_utc, l.player_id, l.entry_kind, l.action_kind,
+                    l.dimension, l.x, l.y, l.z, l.envelope_data, l.envelope_encoding,
+                    l.source_mutation_id, l.rollback_outcome, l.failure_code, l.operator_player_id,
+                    actor.playeruid, actor.last_playername, operator_player.playeruid, operator_player.last_playername
+                FROM requested requested_coordinate
+                JOIN blockmutationlogs l
+                  ON l.dimension = requested_coordinate.dimension
+                 AND l.x = requested_coordinate.x AND l.y = requested_coordinate.y AND l.z = requested_coordinate.z
+                LEFT JOIN players actor ON actor.id = l.player_id
+                LEFT JOIN players operator_player ON operator_player.id = l.operator_player_id
+                WHERE l.id <= @maximum_id
+                ORDER BY l.id DESC
+                LIMIT @row_limit;";
+            AddParameter(cmd, "@dimensions", NpgsqlDbType.Array | NpgsqlDbType.Integer, coordinates.Select(value => value.Dimension).ToArray());
+            AddParameter(cmd, "@xs", NpgsqlDbType.Array | NpgsqlDbType.Integer, coordinates.Select(value => value.X).ToArray());
+            AddParameter(cmd, "@ys", NpgsqlDbType.Array | NpgsqlDbType.Integer, coordinates.Select(value => value.Y).ToArray());
+            AddParameter(cmd, "@zs", NpgsqlDbType.Array | NpgsqlDbType.Integer, coordinates.Select(value => value.Z).ToArray());
+            AddParameter(cmd, "@maximum_id", NpgsqlDbType.Bigint, query.MaximumId);
+            AddParameter(cmd, "@row_limit", NpgsqlDbType.Integer, BlockRollbackLimits.MaximumHistoryRows + 1);
+            return await ReadBlockMutationRowsAsync(cmd, token, BlockRollbackLimits.MaximumHistoryRows,
+                "history row count").ConfigureAwait(false);
+        }, cancellationToken);
+    }
+
+    private static BlockMutationPlayer ReadPlayer(NpgsqlDataReader reader) => new(
+        reader.GetInt64(0), reader.IsDBNull(1) ? null : reader.GetString(1), reader.IsDBNull(2) ? null : reader.GetString(2));
+
+    private static async Task<IReadOnlyList<BlockMutationLogRow>> ReadBlockMutationRowsAsync(NpgsqlCommand cmd,
+        CancellationToken cancellationToken, int maximumRows, string limitName) {
+        var rows = new List<BlockMutationLogRow>();
+        await using NpgsqlDataReader reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) {
+            rows.Add(new BlockMutationLogRow(
+                reader.GetInt64(0), reader.GetInt64(1), reader.IsDBNull(2) ? null : reader.GetInt64(2),
+                (BlockMutationEntryKind)reader.GetInt32(3), (BlockMutationActionKind)reader.GetInt32(4),
+                reader.GetInt32(5), reader.GetInt32(6), reader.GetInt32(7), reader.GetInt32(8),
+                reader.GetFieldValue<byte[]>(9), reader.GetInt32(10), reader.IsDBNull(11) ? null : reader.GetInt64(11),
+                reader.IsDBNull(12) ? null : (BlockMutationRollbackOutcome)reader.GetInt32(12),
+                reader.IsDBNull(13) ? null : reader.GetString(13), reader.IsDBNull(14) ? null : reader.GetInt64(14),
+                reader.IsDBNull(15) ? null : reader.GetString(15), reader.IsDBNull(16) ? null : reader.GetString(16),
+                reader.IsDBNull(17) ? null : reader.GetString(17), reader.IsDBNull(18) ? null : reader.GetString(18)
+            ));
+        }
+        if (rows.Count > maximumRows) throw new BlockRollbackLimitExceededException(limitName, maximumRows);
+        return rows.AsReadOnly();
+    }
+
+    private static int ClampCoordinate(long value) => value < int.MinValue ? int.MinValue
+        : value > int.MaxValue ? int.MaxValue : (int)value;
 
     public void AddBlockLog(string? playername, string? playeruid, string actiontype, string block, string? itemstack, int x, int y, int z, int? oldblockid) {
         long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();

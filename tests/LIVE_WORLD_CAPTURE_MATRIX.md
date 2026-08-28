@@ -32,3 +32,26 @@ For every stored row, inspect that `dimension`, absolute `x/y/z`, actor UID/name
 payloads, parse the tree and confirm `materials` is a string array, `posy` is the original
 `BlockPos.InternalY`, and no `decorIds`, `decorRot`, or `beams` field is present. Also force one
 database append failure and confirm a single server-log error occurs without interrupting gameplay.
+
+## Guarded replay verification
+
+The automated suites additionally cover pure reverse planning (including partial successful-chain
+resume), exact PostgreSQL candidate/history projections and index plans, eager malformed-envelope
+rejection, exact-inverse enforcement for every outcome, bounded query overflow, disposal of queued
+main-thread work, and the actual 1.22.7 microblock `StringArrayAttribute` material reader followed
+by `FromTreeAttributes` / `HistoryStateRestore` on an initialized fixture. They still do **not**
+claim to execute a live server-world replay. Before exposing a command, verify this matrix on the
+same unmodified 1.22.7 dedicated server:
+
+| Replay case | Expected result |
+| --- | --- |
+| Plain block to air and air to plain block | solid layer restored exactly; fluid layer untouched; clients and neighbors update |
+| Chisel and microblock (including snow variants) | exact block/BE pair restored; canonical material strings resolve; voxels match source `Before` |
+| Container, arbitrary BE, fluid, decor, missing asset, or modded lookalike | no world write; durable failed outcome with stable reason |
+| Other-player or post-selection mutation at the coordinate | no world write; older source attempts are skipped |
+| Same-player `A -> B -> C` chain | `C -> B`, then `B -> A`, strict source-id descending order |
+| Restart after newest source already succeeded | newest is idempotently skipped and the validated inverse permits the older source to resume |
+| Mutation between selection cutoff and generation snapshot | second history cutoff sees it and blocks the source |
+| Mutation after generation snapshot | generation guard rejects the apply |
+| Successful world restore followed by forced audit append failure | batch stops; retry reports `audit-missing-manual-reconciliation` and never applies twice |
+| Throw after `SetBlock` during BE restoration | batch stops with `restore-failed`; best-effort source `After` repair is attempted |

@@ -44,6 +44,39 @@ internal static class MicroblockTreeCodec {
         }
     }
 
+    /// <summary>
+    /// Parses an owned canonical payload into a detached restore tree and validates every stored
+    /// material code against the current registry. Vintage Story 1.22.7's native material reader
+    /// resolves StringArrayAttribute domain:path values during FromTreeAttributes.
+    /// </summary>
+    internal static bool TryPrepareRestore(
+        byte[] bytes,
+        IWorldAccessor world,
+        BlockPos position,
+        string blockAssetCode,
+        out TreeAttribute restoreTree
+    ) {
+        restoreTree = null!;
+        if (bytes == null || bytes.Length > EnvelopeBlockState.MaximumTreeAttributeBytes) return false;
+        try {
+            TreeAttribute decoded = TreeAttribute.CreateFromBytes(bytes);
+            if (decoded["materials"] is not StringArrayAttribute materials || materials.value == null
+                || materials.value.Length is < 1 or > MaximumMaterials) return false;
+            string[] materialCodes = (string[])materials.value.Clone();
+            foreach (string code in materialCodes) {
+                if (!TryResolveExactMaterial(world, code)) return false;
+            }
+            if (!ValidateCanonicalTree(decoded, position, blockAssetCode, materialCodes)) return false;
+            if (!decoded.ToBytes().AsSpan().SequenceEqual(bytes)) return false;
+            restoreTree = decoded;
+            return true;
+        }
+        catch {
+            restoreTree = null!;
+            return false;
+        }
+    }
+
     private static bool TryCanonicalize(
         TreeAttribute tree,
         BlockEntityMicroBlock blockEntity,
@@ -177,5 +210,16 @@ internal static class MicroblockTreeCodec {
             || location.Domain.Contains(':') || location.Path.Contains(':')) return false;
         code = location.Domain + ":" + location.Path;
         return StrictUtf8.GetByteCount(code) <= EnvelopeBlockState.MaximumAssetCodeBytes;
+    }
+
+    private static bool TryResolveExactMaterial(IWorldAccessor world, string code) {
+        if (string.IsNullOrWhiteSpace(code)) return false;
+        int separator = code.IndexOf(':');
+        if (separator <= 0 || separator != code.LastIndexOf(':') || separator == code.Length - 1) return false;
+        var location = new AssetLocation(code[..separator], code[(separator + 1)..]);
+        Block? material = world.GetBlock(location);
+        return TryAssetCode(material, out string resolvedCode) && !material!.IsMissing
+            && !BlockMutationCapture.IsExplicitAir(material)
+            && string.Equals(code, resolvedCode, StringComparison.Ordinal);
     }
 }

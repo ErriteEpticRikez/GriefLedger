@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 
 namespace GriefLedger.Rollback;
 
@@ -20,6 +22,67 @@ public enum BlockMutationRollbackOutcome {
     Succeeded = 1,
     Failed = 2,
     Skipped = 3
+}
+
+/// <summary>An immutable identity from the shared players table.</summary>
+public sealed record BlockMutationPlayer(long Id, string? PlayerUid, string? LastPlayerName);
+
+public enum BlockMutationPlayerNameResolutionKind {
+    NotFound = 0,
+    Unique = 1,
+    Ambiguous = 2
+}
+
+/// <summary>A name lookup never guesses when more than one immutable UID has used the name.</summary>
+public sealed class BlockMutationPlayerNameResolution {
+    internal BlockMutationPlayerNameResolution(IReadOnlyList<BlockMutationPlayer> matches) {
+        Matches = matches ?? throw new ArgumentNullException(nameof(matches));
+        Kind = matches.Count switch {
+            0 => BlockMutationPlayerNameResolutionKind.NotFound,
+            1 => BlockMutationPlayerNameResolutionKind.Unique,
+            _ => BlockMutationPlayerNameResolutionKind.Ambiguous
+        };
+    }
+
+    public BlockMutationPlayerNameResolutionKind Kind { get; }
+    public IReadOnlyList<BlockMutationPlayer> Matches { get; }
+    public BlockMutationPlayer? Player => Kind == BlockMutationPlayerNameResolutionKind.Unique ? Matches[0] : null;
+}
+
+/// <summary>Bounded exact-ledger candidate selection. Supply exactly one player key.</summary>
+public sealed record BlockMutationTargetQuery {
+    public long? PlayerId { get; init; }
+    public string? PlayerUid { get; init; }
+    public int Dimension { get; init; }
+    public int CenterX { get; init; }
+    public int CenterY { get; init; }
+    public int CenterZ { get; init; }
+    public int Radius { get; init; }
+    public bool BreakOnly { get; init; }
+    public long CutoffId { get; init; }
+
+    internal void Validate() {
+        if ((PlayerId.HasValue ? 1 : 0) + (!string.IsNullOrWhiteSpace(PlayerUid) ? 1 : 0) != 1) {
+            throw new ArgumentException("Supply exactly one target player id or nonempty immutable UID.");
+        }
+        if (PlayerId.HasValue && PlayerId.Value <= 0) throw new ArgumentOutOfRangeException(nameof(PlayerId));
+        if (Radius is < 0 or > BlockRollbackLimits.MaximumRadius) throw new ArgumentOutOfRangeException(nameof(Radius));
+        if (CutoffId < 0) throw new ArgumentOutOfRangeException(nameof(CutoffId));
+    }
+}
+
+/// <summary>Coordinates whose complete exact-ledger histories are required by the planner.</summary>
+public sealed record BlockMutationHistoryQuery {
+    public required IReadOnlyList<BlockMutationCoordinate> Coordinates { get; init; }
+    public long MaximumId { get; init; }
+
+    internal void Validate() {
+        ArgumentNullException.ThrowIfNull(Coordinates);
+        if (MaximumId < 0) throw new ArgumentOutOfRangeException(nameof(MaximumId));
+        if (Coordinates.Count > BlockRollbackLimits.MaximumUniqueCoordinates) {
+            throw new BlockRollbackLimitExceededException("unique coordinate count", BlockRollbackLimits.MaximumUniqueCoordinates);
+        }
+    }
 }
 
 /// <summary>
@@ -47,6 +110,7 @@ public sealed class BlockMutationAppend {
         string? operatorPlayerUid = null
     ) {
         ArgumentNullException.ThrowIfNull(envelope);
+        if (envelope.Before.Equals(envelope.After)) throw new ArgumentException("A ledger transition must change canonical state.", nameof(envelope));
         if (!Enum.IsDefined(entryKind)) throw new ArgumentOutOfRangeException(nameof(entryKind));
         if (!Enum.IsDefined(actionKind) || actionKind == BlockMutationActionKind.Unknown) throw new ArgumentOutOfRangeException(nameof(actionKind));
         if (rollbackOutcome.HasValue && !Enum.IsDefined(rollbackOutcome.Value)) throw new ArgumentOutOfRangeException(nameof(rollbackOutcome));
@@ -124,11 +188,38 @@ public sealed class BlockMutationAppend {
 /// <summary>A typed immutable row returned by future ledger readers.</summary>
 public sealed class BlockMutationLogRow {
     private readonly byte[] envelopeData;
+    private readonly BlockStateEnvelope envelope;
 
     internal BlockMutationLogRow(long id, long timestampUtc, long? actorPlayerId, BlockMutationEntryKind entryKind,
         BlockMutationActionKind actionKind, int dimension, int x, int y, int z, byte[] envelopeData,
         int envelopeEncoding, long? sourceMutationId, BlockMutationRollbackOutcome? rollbackOutcome,
-        string? failureCode, long? operatorPlayerId) {
+        string? failureCode, long? operatorPlayerId, string? actorPlayerUid = null,
+        string? actorPlayerName = null, string? operatorPlayerUid = null, string? operatorPlayerName = null) {
+        if (id <= 0) throw new InvalidDataException("A ledger row id must be positive.");
+        if (timestampUtc < 0) throw new InvalidDataException("A ledger row timestamp must be nonnegative.");
+        if (!Enum.IsDefined(entryKind)) throw new InvalidDataException("A ledger row has an unknown entry kind.");
+        if (!Enum.IsDefined(actionKind) || actionKind == BlockMutationActionKind.Unknown) throw new InvalidDataException("A ledger row has an unknown action kind.");
+        if (envelopeEncoding != BlockStateEnvelope.BinaryEncoding) throw new InvalidDataException("A ledger row uses an unsupported envelope encoding.");
+        if (rollbackOutcome.HasValue && !Enum.IsDefined(rollbackOutcome.Value)) throw new InvalidDataException("A ledger row has an unknown rollback outcome.");
+        if (entryKind == BlockMutationEntryKind.Mutation
+            && (actionKind == BlockMutationActionKind.Rollback || sourceMutationId != null || rollbackOutcome != null
+                || failureCode != null || operatorPlayerId != null)) {
+            throw new InvalidDataException("A mutation ledger row carries rollback-only fields.");
+        }
+        if (entryKind == BlockMutationEntryKind.Rollback
+            && (actionKind != BlockMutationActionKind.Rollback || sourceMutationId <= 0 || rollbackOutcome == null
+                || operatorPlayerId <= 0 || string.IsNullOrWhiteSpace(operatorPlayerUid))) {
+            throw new InvalidDataException("A rollback ledger row is missing required source, outcome, or operator identity fields.");
+        }
+        if (sourceMutationId >= id) throw new InvalidDataException("A rollback source must precede its outcome row.");
+        if (rollbackOutcome == BlockMutationRollbackOutcome.Succeeded && failureCode != null
+            || rollbackOutcome is BlockMutationRollbackOutcome.Failed or BlockMutationRollbackOutcome.Skipped
+                && string.IsNullOrWhiteSpace(failureCode)) {
+            throw new InvalidDataException("A rollback ledger row has inconsistent outcome and failure fields.");
+        }
+        ArgumentNullException.ThrowIfNull(envelopeData);
+        envelope = BlockStateEnvelope.Decode(envelopeData);
+        if (envelope.Before.Equals(envelope.After)) throw new InvalidDataException("A ledger row contains a no-op state transition.");
         Id = id;
         TimestampUtc = timestampUtc;
         ActorPlayerId = actorPlayerId;
@@ -144,6 +235,10 @@ public sealed class BlockMutationLogRow {
         RollbackOutcome = rollbackOutcome;
         FailureCode = failureCode;
         OperatorPlayerId = operatorPlayerId;
+        ActorPlayerUid = actorPlayerUid;
+        ActorPlayerName = actorPlayerName;
+        OperatorPlayerUid = operatorPlayerUid;
+        OperatorPlayerName = operatorPlayerName;
     }
 
     public long Id { get; }
@@ -161,9 +256,12 @@ public sealed class BlockMutationLogRow {
     public BlockMutationRollbackOutcome? RollbackOutcome { get; }
     public string? FailureCode { get; }
     public long? OperatorPlayerId { get; }
+    public string? ActorPlayerUid { get; }
+    public string? ActorPlayerName { get; }
+    public string? OperatorPlayerUid { get; }
+    public string? OperatorPlayerName { get; }
+    public BlockMutationCoordinate Coordinate => new(Dimension, X, Y, Z);
+    public BlockStateEnvelope Envelope => envelope;
 
-    public BlockStateEnvelope DecodeEnvelope() {
-        if (EnvelopeEncoding != BlockStateEnvelope.BinaryEncoding) throw new InvalidOperationException("The ledger row uses an unsupported envelope encoding.");
-        return BlockStateEnvelope.Decode(envelopeData);
-    }
+    public BlockStateEnvelope DecodeEnvelope() => envelope;
 }

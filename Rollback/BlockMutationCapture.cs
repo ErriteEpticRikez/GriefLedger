@@ -303,9 +303,9 @@ public sealed class BlockMutationCapture : IDisposable {
     }
 
     internal static bool IsRecognizedMicroblockPair(Block? block, BlockEntity? blockEntity, BlockPos position) {
-        if (block == null || blockEntity == null || block.GetType().Assembly.GetName().Name != SurvivalAssemblyName
+        if (!IsRecognizedMicroblockBlock(block) || blockEntity == null
             || blockEntity.GetType().Assembly.GetName().Name != SurvivalAssemblyName) return false;
-        if (block.Code?.Domain != "game" || blockEntity.Pos == null
+        if (block!.Code?.Domain != "game" || blockEntity.Pos == null
             || blockEntity.Pos.X != position.X || blockEntity.Pos.Y != position.Y
             || blockEntity.Pos.Z != position.Z || blockEntity.Pos.dimension != position.dimension) return false;
 
@@ -317,6 +317,14 @@ public sealed class BlockMutationCapture : IDisposable {
             || blockType == typeof(BlockMicroBlock)
             && entityType == typeof(BlockEntityMicroBlock)
             && block.Code.Path is "microblock" or "microblock-snow";
+    }
+
+    internal static bool IsRecognizedMicroblockBlock(Block? block) {
+        if (block == null || block.GetType().Assembly.GetName().Name != SurvivalAssemblyName
+            || block.Code?.Domain != "game") return false;
+        Type blockType = block.GetType();
+        return blockType == typeof(BlockChisel) && block.Code.Path is "chiseledblock" or "chiseledblock-snow"
+            || blockType == typeof(BlockMicroBlock) && block.Code.Path is "microblock" or "microblock-snow";
     }
 
     private static bool TryGetAssetCode(Block? block, out string assetCode) {
