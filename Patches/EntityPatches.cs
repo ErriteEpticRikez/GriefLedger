@@ -7,7 +7,7 @@ using Vintagestory.API.Common.Entities;
 using Vintagestory.API.MathTools;
 using Vintagestory.GameContent;
 
-namespace GriefWarden.Patches;
+namespace GriefLedger.Patches;
 
 [HarmonyPatch(typeof(EntityBoat), nameof(EntityBoat.DidUnmount))]
 public class EntityBoatDidUnmountPatch {

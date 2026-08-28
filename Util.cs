@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Text;
 using Vintagestory.API.Common;
 
-namespace GriefWarden;
+namespace GriefLedger;
 
 public static class Util {
     public static string? GetPlayerCurrentItemstackName(IPlayer player) {

@@ -2,7 +2,7 @@
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.MathTools;
 
-namespace GriefWarden.Hooks;
+namespace GriefLedger.Hooks;
 
 public class EntityHooks {
     public EntityHooks() {

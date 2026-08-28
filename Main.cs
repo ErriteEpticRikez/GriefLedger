@@ -1,10 +1,10 @@
-﻿using GriefWarden.Hooks;
+﻿using GriefLedger.Hooks;
 using HarmonyLib;
 using System.Collections.Generic;
 using Vintagestory.API.Common;
 using Vintagestory.API.Server;
 
-namespace GriefWarden;
+namespace GriefLedger;
 
 public class Main : ModSystem {
     private Harmony harmony = null;

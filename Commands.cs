@@ -7,18 +7,17 @@ using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 using Vintagestory.GameContent;
 
-namespace GriefWarden;
+namespace GriefLedger;
 
 public class Commands {
     public Commands() {
-        Main.API.Permissions.RegisterPrivilege("griefwarden", "Use GriefWarden commands.", true);
+        Main.API.Permissions.RegisterPrivilege("griefledger", "Use GriefLedger commands.", true);
 
-        //Main.API.ChatCommands.Create("blocklog").WithDescription("Inspect block logs at block looked at.").RequiresPrivilege("griefwarden").HandleWith(new CommandDel(this.OnBlockLogCommand));
-        Main.API.RegisterCommand("rollbackbreaks", "Revert BROKE changes made by a specific player in a radius. If no radius is specified, it defaults to 5.", "-p USERNAME -r #", new ServerChatCommandDelegate(this.OnRollbackBreaksCommand), "griefwarden");
-        Main.API.RegisterCommand("blocklog", "Inspect block logs at block looked at if no radius is specified, or around the player if radius is.", "-r # -p #", new ServerChatCommandDelegate(this.OnBlockLogCommand), "griefwarden");
-        Main.API.RegisterCommand("entitylog", "Inspect entity logs in radius around you.", "(-r # OR -e ENTITYID) -p #", new ServerChatCommandDelegate(this.OnEntityLogCommand), "griefwarden");
-        Main.API.RegisterCommand("containerlog", "Inspect container logs at container looked at.", "-p #", new ServerChatCommandDelegate(this.OnContainerLogCommand), "griefwarden");
-        Main.API.RegisterCommand("tpboatid", "Performs a sequence of events to teleport a boat to you.", "-e ENTITYID", new ServerChatCommandDelegate(this.OnTPBoatID), "griefwarden");
+        Main.API.RegisterCommand("rollbackbreaks", "Revert logged block breaks by a player within a radius (default: 5).", "-p USERNAME -r #", new ServerChatCommandDelegate(this.OnRollbackBreaksCommand), "griefledger");
+        Main.API.RegisterCommand("blocklog", "Inspect block logs at the looked-at block, or around you when a radius is supplied.", "-r # -p #", new ServerChatCommandDelegate(this.OnBlockLogCommand), "griefledger");
+        Main.API.RegisterCommand("entitylog", "Inspect entity logs around you or for an entity ID.", "(-r # OR -e ENTITYID) -p #", new ServerChatCommandDelegate(this.OnEntityLogCommand), "griefledger");
+        Main.API.RegisterCommand("containerlog", "Inspect logs for the looked-at container.", "-p #", new ServerChatCommandDelegate(this.OnContainerLogCommand), "griefledger");
+        Main.API.RegisterCommand("tpboatid", "Teleport a boat to you by entity ID.", "-e ENTITYID", new ServerChatCommandDelegate(this.OnTPBoatID), "griefledger");
     }
 
     private void OnRollbackBreaksCommand(IServerPlayer player, int groupId, CmdArgs args) {

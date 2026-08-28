@@ -2,7 +2,7 @@
 using Vintagestory.API.Common;
 using Vintagestory.GameContent;
 
-namespace GriefWarden.Patches;
+namespace GriefLedger.Patches;
 
 [HarmonyPatch(typeof(InventoryBase), nameof(InventoryBase.ActivateSlot))]
 public class InventoryBasePatch {

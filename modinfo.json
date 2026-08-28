@@ -1,13 +1,13 @@
 {
     "$schema": "https://moddbcdn.vintagestory.at/schema/modinfo.latest.json",
     "type": "Code",
-    "modid": "griefwarden",
-    "name": "GriefWarden",
+    "modid": "griefledger",
+    "name": "GriefLedger",
     "authors": [
         "Windwhistle"
     ],
-    "description": "Keeps an in-game accessible log of various types of things done in-game.",
-    "version": "1.0.0",
+    "description": "PostgreSQL-backed server-side audit ledger for in-game interactions.",
+    "version": "2.0.0",
     "side": "Server",
     "requiredOnClient": false,
     "requiredOnServer": true

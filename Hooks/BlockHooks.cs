@@ -3,7 +3,7 @@ using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 using Vintagestory.GameContent;
 
-namespace GriefWarden.Hooks;
+namespace GriefLedger.Hooks;
 
 public class BlockHooks {
     public BlockHooks() {

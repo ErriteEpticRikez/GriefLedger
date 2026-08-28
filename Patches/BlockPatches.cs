@@ -6,7 +6,7 @@ using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
 using Vintagestory.GameContent;
 
-namespace GriefWarden.Patches;
+namespace GriefLedger.Patches;
 
 // Harmony can't find the method without types specified for god knows what reason
 [HarmonyPatch(typeof(Block), nameof(Block.OnBlockExploded), new Type[] { typeof(IWorldAccessor), typeof(BlockPos), typeof(BlockPos), typeof(EnumBlastType), typeof(string) })]
