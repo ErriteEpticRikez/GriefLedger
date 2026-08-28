@@ -37,12 +37,45 @@ VINTAGE_STORY=/path/to/VintageStory dotnet test tests/GriefLedger.PostgresIntegr
 
 The reflection test verifies the exact Vintage Story 1.22.7 rollback mutation targets without starting a world. The integration test uses the configured PostgreSQL instance and the configured `DB_PORT` (with process environment values taking precedence over `/opt/app/.env`), creates temporary `gl_it_…` schemas, verifies fresh and legacy bootstrap plus ledger ordering/constraints, and removes them when finished. It requires the same database settings above and PostgreSQL 17.x.
 
+## Exact block rollback
+
+Exact rollback is deliberately narrower than audit logging. When all Vintage Story 1.22.7 capture seams resolve, GriefLedger writes an append-only before/after state envelope for each supported player mutation. PostgreSQL retention is not artificially capped; set database backups, archival, partitioning, and retention according to your server's expected volume.
+
+The replay allowlist is intentionally small:
+
+- explicit `game:air` and plain, exact `Block` instances with no block entity, fluid, or decor;
+- vanilla chisel/microblock state captured from the supported vanilla microblock block entity, with its material asset codes; and
+- only player block breaks, placements, vanilla chisel conversion, and vanilla chisel voxel mutations.
+
+Chiseled blocks are restored from their captured microblock tree through the vanilla block-entity history restore path. The snapshot rejects external sub-decors, `decorIds`/`decorRot`, beams, unknown tree fields, missing assets, and malformed material mappings instead of guessing.
+
+The following are audit-only and never replayed by `/rollbackbreaks` or `/rollbackblocks`: containers and their inventories, arbitrary block entities, fluids, decorations, entities and entity inventories, explosions, pickups, unsupported mod blocks, arbitrary modded chisel state, and all legacy `blocklogs` rows created before exact envelopes existed. Those records remain useful to inspect with the existing log commands, but cannot be converted into an exact rollback safely.
+
+Replay uses immutable player UIDs, not mutable display names. It takes two durable ledger cutoffs, uses bounded candidate/history reads (radius at most 256, at most 10,000 selected mutations and coordinates, and at most 200,000 history rows), verifies every inverse state chain newest-first, checks the current world state and capture generation on the server main thread, and records every success, skip, or failure as another append-only ledger entry. A concurrent mutation, later activity at the same coordinate, another player's modification, a missing asset, or an unexpected current state causes a safe skip/failure rather than a blind overwrite. If a safety-critical restore or audit condition stops a batch, the result is explicitly `batch-stopped` and gives the unprocessed selected count; it is never presented as complete. Only one exact replay operation runs at a time.
+
+Exact capture is capability-gated. If the known Vintage Story seams are unavailable, GriefLedger leaves the database and legacy audit commands running but disables exact rollback with a clear command error. Captures made before the exact envelope ledger are inspection-only.
+
 ## In-game commands
 
 All commands require the `griefledger` privilege.
 
-- `/rollbackbreaks -p USERNAME -r #` — revert logged block breaks in a radius (default: 5).
+- `/rollbackbreaks -u PLAYERUID -r #` — exactly revert supported, captured block breaks in a radius (default: 5; maximum: 256). This is the recommended form.
+- `/rollbackblocks -u PLAYERUID -r #` — exactly revert supported, captured breaks, placements, and vanilla chisel mutations in a radius (default: 5; maximum: 256).
+- `/rollbackbreaks -p USERNAME -r #` and `/rollbackblocks -p USERNAME -r #` — name convenience forms. They run only when the case-insensitive last-known name maps to one immutable UID; ambiguous, missing, and legacy UID-less names are rejected. Prefer `-u` for incident response.
 - `/blocklog -p # -r #` — inspect a looked-at block, or an area around you with a radius.
 - `/entitylog -p # -r #` or `/entitylog -p # -e ENTITYID` — inspect nearby entity activity or one entity’s history.
 - `/containerlog -p #` — inspect the looked-at container’s history.
 - `/tpboatid -e ENTITYID` — teleport a boat to you by entity ID.
+
+For example, from the affected dimension and area:
+
+```text
+/rollbackbreaks -u 5d6f… -r 12
+/rollbackblocks -u 5d6f… -r 12
+```
+
+The command returns its immutable ledger cutoff and last history ID, selected/processed/unprocessed totals, succeeded/failed/skipped totals, and stable reason counts. It starts asynchronously so database reads never block the Vintage Story main thread; final status is sent back on that thread. A safety stop is reported as `batch-stopped`, never as complete; an operational durability failure likewise returns an explicitly labelled partial result and stops replay.
+
+## Live-world verification boundary
+
+`tests/LIVE_WORLD_CAPTURE_MATRIX.md` records the manual Vintage Story world actions still required to verify captures and replay against a running server/client. The automated suite validates the real 1.22.7 reflection targets, state codecs, planner, lifecycle, and PostgreSQL ledger, but it does not simulate a connected live world. Before production use, perform that matrix on a staging server—especially a chiseled block with no external decor or beams—and confirm the command reports the expected durable outcome entries.

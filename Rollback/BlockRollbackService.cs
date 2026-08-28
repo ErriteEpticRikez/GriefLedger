@@ -38,11 +38,19 @@ public sealed record BlockRollbackAttemptResult(
 
 public sealed class BlockRollbackResult {
     internal BlockRollbackResult(long cutoffId, long historyThroughId, string? operationFailureCode,
-        IReadOnlyList<BlockRollbackAttemptResult> attempts) {
+        IReadOnlyList<BlockRollbackAttemptResult> attempts, int? totalSelectedSourceCount = null) {
+        ArgumentNullException.ThrowIfNull(attempts);
+        int selectedCount = totalSelectedSourceCount ?? attempts.Count;
+        if (selectedCount < attempts.Count) {
+            throw new ArgumentOutOfRangeException(nameof(totalSelectedSourceCount),
+                "The selected source count cannot be smaller than the attempted source count.");
+        }
         CutoffId = cutoffId;
         HistoryThroughId = historyThroughId;
         OperationFailureCode = operationFailureCode;
         Attempts = attempts;
+        TotalSelectedSourceCount = selectedCount;
+        UnprocessedSourceCount = selectedCount - attempts.Count;
         var counts = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (BlockRollbackAttemptResult attempt in attempts) {
             string key = attempt.FailureCode ?? "succeeded";
@@ -61,6 +69,8 @@ public sealed class BlockRollbackResult {
     public long HistoryThroughId { get; }
     public string? OperationFailureCode { get; }
     public IReadOnlyList<BlockRollbackAttemptResult> Attempts { get; }
+    public int TotalSelectedSourceCount { get; }
+    public int UnprocessedSourceCount { get; }
     public IReadOnlyDictionary<string, int> ReasonCounts { get; }
     public IReadOnlyList<long> SucceededSourceIds { get; }
     public IReadOnlyList<long> FailedSourceIds { get; }
@@ -207,17 +217,19 @@ public sealed class BlockRollbackService : IDisposable {
 
         var attempts = new List<BlockRollbackAttemptResult>(plan.Entries.Count);
         var blockedCoordinates = new HashSet<BlockMutationCoordinate>();
+        string? operationFailureCode = null;
         foreach (BlockRollbackPlanEntry entry in plan.Entries) {
             cancellationToken.ThrowIfCancellationRequested();
             BlockMutationLogRow source = entry.Source;
             if (entry.Disposition == BlockRollbackPlanDisposition.Skip) {
                 await AppendOutcomeAsync(request, source, BlockMutationRollbackOutcome.Skipped,
-                    entry.FailureCode!, attempts, cutoff, historyThrough).ConfigureAwait(false);
+                    entry.FailureCode!, attempts, cutoff, historyThrough, plan.Entries.Count).ConfigureAwait(false);
                 continue;
             }
             if (blockedCoordinates.Contains(source.Coordinate)) {
                 await AppendOutcomeAsync(request, source, BlockMutationRollbackOutcome.Skipped,
-                    BlockRollbackFailureCodes.FailedLaterUnwind, attempts, cutoff, historyThrough).ConfigureAwait(false);
+                    BlockRollbackFailureCodes.FailedLaterUnwind, attempts, cutoff, historyThrough,
+                    plan.Entries.Count).ConfigureAwait(false);
                 continue;
             }
 
@@ -238,13 +250,17 @@ public sealed class BlockRollbackService : IDisposable {
                 return new QueuedWorldAttempt(applied, outcome, applied.FailureCode, auditTask);
             }, "griefledger-rollback-apply", cancellationToken).ConfigureAwait(false);
             await CompleteOutcomeAsync(source, attempt.Outcome, attempt.FailureCode, attempt.AuditTask,
-                attempts, cutoff, historyThrough).ConfigureAwait(false);
+                attempts, cutoff, historyThrough, plan.Entries.Count).ConfigureAwait(false);
             if (attempt.ApplyResult.Succeeded) continue;
 
             blockedCoordinates.Add(source.Coordinate);
-            if (attempt.ApplyResult.StopBatch) break;
+            if (attempt.ApplyResult.StopBatch) {
+                operationFailureCode = BlockRollbackFailureCodes.BatchStopped;
+                break;
+            }
         }
-        return new BlockRollbackResult(cutoff, historyThrough, null, attempts.AsReadOnly());
+        return new BlockRollbackResult(cutoff, historyThrough, operationFailureCode,
+            attempts.AsReadOnly(), plan.Entries.Count);
     }
 
     private Task<long> QueueOutcomeAppend(BlockRollbackRequest request, BlockMutationLogRow source,
@@ -261,7 +277,7 @@ public sealed class BlockRollbackService : IDisposable {
 
     private async Task AppendOutcomeAsync(BlockRollbackRequest request, BlockMutationLogRow source,
         BlockMutationRollbackOutcome outcome, string? failureCode, List<BlockRollbackAttemptResult> attempts,
-        long cutoff, long historyThrough) {
+        long cutoff, long historyThrough, int totalSelectedSourceCount) {
         Task<long> auditTask;
         try {
             auditTask = QueueOutcomeAppend(request, source, outcome, failureCode);
@@ -270,12 +286,13 @@ public sealed class BlockRollbackService : IDisposable {
             auditTask = Task.FromException<long>(exception);
         }
         await CompleteOutcomeAsync(source, outcome, failureCode, auditTask,
-            attempts, cutoff, historyThrough).ConfigureAwait(false);
+            attempts, cutoff, historyThrough, totalSelectedSourceCount).ConfigureAwait(false);
     }
 
     private static async Task CompleteOutcomeAsync(BlockMutationLogRow source,
         BlockMutationRollbackOutcome outcome, string? failureCode, Task<long> auditTask,
-        List<BlockRollbackAttemptResult> attempts, long cutoff, long historyThrough) {
+        List<BlockRollbackAttemptResult> attempts, long cutoff, long historyThrough,
+        int totalSelectedSourceCount) {
         try {
             // Deliberately no cancellation wait here. Once an outcome append is accepted—most
             // importantly after a successful world write—its durable result has priority.
@@ -286,7 +303,7 @@ public sealed class BlockRollbackService : IDisposable {
             BlockRollbackAttemptResult[] partialAttempts = attempts
                 .Append(new BlockRollbackAttemptResult(source.Id, outcome, failureCode, null)).ToArray();
             var partial = new BlockRollbackResult(cutoff, historyThrough,
-                BlockRollbackFailureCodes.OutcomeAppendFailed, partialAttempts);
+                BlockRollbackFailureCodes.OutcomeAppendFailed, partialAttempts, totalSelectedSourceCount);
             throw new BlockRollbackOperationalException(
                 "A rollback world decision could not be recorded durably; replay stopped immediately.", partial, exception);
         }

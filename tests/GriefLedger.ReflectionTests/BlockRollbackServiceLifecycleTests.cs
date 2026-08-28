@@ -76,6 +76,21 @@ public sealed class BlockRollbackServiceLifecycleTests {
             new OversizedList<BlockMutationLogRow>(BlockRollbackLimits.MaximumHistoryRows + 1)));
     }
 
+    [Fact]
+    public void Stopped_result_exposes_selected_and_unprocessed_sources() {
+        var attempted = new BlockRollbackAttemptResult(9, BlockMutationRollbackOutcome.Failed,
+            BlockRollbackFailureCodes.RestoreFailed, 21);
+        var result = new BlockRollbackResult(10, 12, BlockRollbackFailureCodes.BatchStopped,
+            [attempted], totalSelectedSourceCount: 3);
+
+        Assert.Equal(BlockRollbackFailureCodes.BatchStopped, result.OperationFailureCode);
+        Assert.Equal(3, result.TotalSelectedSourceCount);
+        Assert.Equal(2, result.UnprocessedSourceCount);
+        Assert.Single(result.Attempts);
+        Assert.Empty(result.SkippedSourceIds);
+        Assert.Equal(BlockRollbackFailureCodes.RestoreFailed, result.Attempts[0].FailureCode);
+    }
+
     private static BlockRollbackService CreateService(
         Func<string, CancellationToken, Task<BlockMutationPlayer?>>? resolve = null,
         Func<BlockMutationTargetQuery, CancellationToken, Task<IReadOnlyList<BlockMutationLogRow>>>? readTargets = null,

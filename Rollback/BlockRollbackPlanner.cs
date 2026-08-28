@@ -31,6 +31,7 @@ public enum BlockRollbackPlanDisposition {
 
 public static class BlockRollbackFailureCodes {
     public const string TargetPlayerNotFound = "target-player-not-found";
+    public const string BatchStopped = "batch-stopped";
     public const string OutcomeAppendFailed = "outcome-append-failed";
     public const string AlreadySucceeded = "already-succeeded";
     public const string LaterOtherPlayer = "later-other-player";

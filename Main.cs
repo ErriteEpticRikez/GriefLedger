@@ -9,6 +9,7 @@ namespace GriefLedger;
 
 public class Main : ModSystem {
     private Harmony harmony = null;
+    private Commands? commands;
     public static ICoreServerAPI API { get; private set; }
     public static Database Database { get; private set; }
     public static Dictionary<string, string> CachedPlayerUsernames { get; private set; } = new();
@@ -22,6 +23,8 @@ public class Main : ModSystem {
     }
 
     public override void StartServerSide(ICoreServerAPI api) {
+        commands?.Dispose();
+        commands = null;
         ExactBlockRollbackService?.Dispose();
         ExactBlockRollbackService = null;
         ExactBlockMutationCapture?.Dispose();
@@ -32,7 +35,7 @@ public class Main : ModSystem {
         new BlockHooks();
         new EntityHooks();
 
-        new Commands();
+        commands = new Commands();
 
         API.Event.PlayerJoin += OnPlayerJoin;
 
@@ -61,6 +64,8 @@ public class Main : ModSystem {
     }
 
     public override void Dispose() {
+        commands?.Dispose();
+        commands = null;
         ExactBlockRollbackService?.Dispose();
         ExactBlockRollbackService = null;
         ExactBlockMutationCapture?.Dispose();
