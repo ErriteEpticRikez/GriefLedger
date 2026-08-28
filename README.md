@@ -27,10 +27,11 @@ Point `VINTAGE_STORY` at a compatible Vintage Story installation:
 ```bash
 VINTAGE_STORY=/path/to/VintageStory dotnet restore GriefLedger.csproj
 VINTAGE_STORY=/path/to/VintageStory dotnet build GriefLedger.csproj -c Release
+VINTAGE_STORY=/path/to/VintageStory dotnet test tests/GriefLedger.ReflectionTests/GriefLedger.ReflectionTests.csproj -c Release
 VINTAGE_STORY=/path/to/VintageStory dotnet test tests/GriefLedger.PostgresIntegrationTests/GriefLedger.PostgresIntegrationTests.csproj -c Release
 ```
 
-The integration test uses the configured PostgreSQL instance and the configured `DB_PORT` (with process environment values taking precedence over `/opt/app/.env`), creates a temporary `gl_it_…` schema, and removes it when finished. It requires the same database settings above and PostgreSQL 17.x.
+The reflection test verifies the exact Vintage Story 1.22.7 rollback mutation targets without starting a world. The integration test uses the configured PostgreSQL instance and the configured `DB_PORT` (with process environment values taking precedence over `/opt/app/.env`), creates a temporary `gl_it_…` schema, and removes it when finished. It requires the same database settings above and PostgreSQL 17.x.
 
 ## In-game commands
 

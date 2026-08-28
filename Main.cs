@@ -1,4 +1,5 @@
 ﻿using GriefLedger.Hooks;
+using GriefLedger.Rollback;
 using HarmonyLib;
 using System.Collections.Generic;
 using Vintagestory.API.Common;
@@ -11,6 +12,8 @@ public class Main : ModSystem {
     public static ICoreServerAPI API { get; private set; }
     public static Database Database { get; private set; }
     public static Dictionary<string, string> CachedPlayerUsernames { get; private set; } = new();
+    public static RollbackCapability? ExactRollbackCapability { get; private set; }
+    public static bool ExactRollbackAvailable => ExactRollbackCapability?.IsAvailable == true;
 
     public override bool ShouldLoad(EnumAppSide forSide) {
         return forSide == EnumAppSide.Server;
@@ -29,9 +32,19 @@ public class Main : ModSystem {
 
         harmony = new Harmony(Mod.Info.ModID);
         harmony.PatchAll();
+        RollbackTargetStatus legacyChiselAudit = RollbackCapability.EnsureLegacyChiselAuditPatch(harmony);
+        if (!legacyChiselAudit.Patched) {
+            API.Logger.Error(
+                "GriefLedger: Legacy chisel audit patch is unavailable; other audit hooks, database, and commands remain enabled. {0}",
+                legacyChiselAudit.Error ?? "exact ItemChisel target was not resolved"
+            );
+        }
+        ExactRollbackCapability = RollbackCapability.Initialize(api, harmony);
     }
 
     public override void Dispose() {
+        ExactRollbackCapability?.Dispose();
+        ExactRollbackCapability = null;
         Database.Dispose();
 
         harmony?.UnpatchAll(Mod.Info.ModID);
