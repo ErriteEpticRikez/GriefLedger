@@ -2,6 +2,10 @@
 
 GriefLedger is a Vintage Story server-side audit ledger for player, block, entity, and container interactions. It stores all data in PostgreSQL; SQLite databases are not imported automatically.
 
+## Acknowledgements
+
+GriefLedger is a fork of **GriefWarden**, which provided both the inspiration and the original codebase for this mod. We gratefully acknowledge GriefWarden and its contributors for the auditing foundation on which GriefLedger is built.
+
 ## PostgreSQL requirements and startup
 
 Runtime requires PostgreSQL 17 or newer; the automated database suite is tested on PostgreSQL 17.11. The database role must be able to create and validate the GriefLedger tables and indexes in the selected schema. On startup, GriefLedger connects, verifies the server version, applies additive schema migrations, and validates the resulting layout before accepting game activity. Existing `blocklogs` data remains unchanged; exact before/after block states use the separate append-only `blockmutationlogs` ledger. It does not create a named `DB_SCHEMA`; create that schema first. It fails startup if the database is unreachable, configuration is invalid, PostgreSQL is older than 17, or an existing schema is incompatible. Restore or migrate legacy SQLite data separately before enabling the mod.

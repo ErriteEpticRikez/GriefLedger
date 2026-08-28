@@ -6,7 +6,7 @@
     "authors": [
         "Windwhistle"
     ],
-    "description": "PostgreSQL-backed server-side audit ledger for in-game interactions.",
+    "description": "PostgreSQL-backed fork of GriefWarden, extending its server-side interaction audit ledger.",
     "version": "2.0.0",
     "side": "Server",
     "requiredOnClient": false,
