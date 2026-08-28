@@ -75,6 +75,17 @@ public sealed class BlockRollbackPlannerTests {
     }
 
     [Fact]
+    public void Paging_excludes_successful_newer_source_but_its_inverse_allows_older_retry() {
+        BlockMutationLogRow first = Mutation(1, BlockMutationActionKind.Place, A, B);
+        BlockMutationLogRow second = Mutation(2, BlockMutationActionKind.Place, B, C);
+        BlockMutationLogRow success = Rollback(3, second, BlockMutationRollbackOutcome.Succeeded);
+
+        BlockRollbackPlan plan = Build([first], [first, second, success], cutoff: 2, historyThrough: 3);
+
+        Assert.Equal(BlockRollbackPlanDisposition.Apply, Assert.Single(plan.Entries).Disposition);
+    }
+
+    [Fact]
     public void Successful_retry_resolves_earlier_failure_and_allows_older_chain_source() {
         BlockMutationLogRow first = Mutation(1, BlockMutationActionKind.Place, A, B);
         BlockMutationLogRow second = Mutation(2, BlockMutationActionKind.Place, B, C);

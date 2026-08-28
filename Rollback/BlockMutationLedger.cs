@@ -49,6 +49,11 @@ public sealed class BlockMutationPlayerNameResolution {
     public BlockMutationPlayer? Player => Kind == BlockMutationPlayerNameResolutionKind.Unique ? Matches[0] : null;
 }
 
+public sealed record BlockMutationCandidatePage(
+    IReadOnlyList<BlockMutationLogRow> Rows,
+    bool HasMoreCandidates
+);
+
 /// <summary>Bounded exact-ledger candidate selection. Supply exactly one player key.</summary>
 public sealed record BlockMutationTargetQuery {
     public long? PlayerId { get; init; }
@@ -60,6 +65,7 @@ public sealed record BlockMutationTargetQuery {
     public int Radius { get; init; }
     public bool BreakOnly { get; init; }
     public long CutoffId { get; init; }
+    public long? BeforeSourceIdExclusive { get; init; }
 
     internal void Validate() {
         if ((PlayerId.HasValue ? 1 : 0) + (!string.IsNullOrWhiteSpace(PlayerUid) ? 1 : 0) != 1) {
@@ -68,17 +74,20 @@ public sealed record BlockMutationTargetQuery {
         if (PlayerId.HasValue && PlayerId.Value <= 0) throw new ArgumentOutOfRangeException(nameof(PlayerId));
         if (Radius is < 0 or > BlockRollbackLimits.MaximumRadius) throw new ArgumentOutOfRangeException(nameof(Radius));
         if (CutoffId < 0) throw new ArgumentOutOfRangeException(nameof(CutoffId));
+        if (BeforeSourceIdExclusive is <= 0) throw new ArgumentOutOfRangeException(nameof(BeforeSourceIdExclusive));
     }
 }
 
 /// <summary>Coordinates whose complete exact-ledger histories are required by the planner.</summary>
 public sealed record BlockMutationHistoryQuery {
     public required IReadOnlyList<BlockMutationCoordinate> Coordinates { get; init; }
+    public long MinimumId { get; init; }
     public long MaximumId { get; init; }
 
     internal void Validate() {
         ArgumentNullException.ThrowIfNull(Coordinates);
-        if (MaximumId < 0) throw new ArgumentOutOfRangeException(nameof(MaximumId));
+        if (MinimumId < 0) throw new ArgumentOutOfRangeException(nameof(MinimumId));
+        if (MaximumId < MinimumId) throw new ArgumentOutOfRangeException(nameof(MaximumId));
         if (Coordinates.Count > BlockRollbackLimits.MaximumUniqueCoordinates) {
             throw new BlockRollbackLimitExceededException("unique coordinate count", BlockRollbackLimits.MaximumUniqueCoordinates);
         }

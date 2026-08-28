@@ -10,6 +10,7 @@ namespace GriefLedger.PostgresIntegrationTests;
 
 public sealed class Postgres17IntegrationTests {
     private static readonly string[] RequiredSettings = ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"];
+    private static readonly string[] OptionalConnectionSettings = ["DB_SSL_MODE", "DB_SSL_ROOT_CERTIFICATE"];
 
     [Fact]
     public void Block_state_envelope_is_deterministic_bounded_and_immutable() {
@@ -107,6 +108,7 @@ public sealed class Postgres17IntegrationTests {
             ExerciseFinalPlayerNameUpdate();
             await ExerciseLedgerWriterAndCutoff(admin, schema);
             await ExerciseExactLedgerReaders(admin, schema);
+            await ExerciseBoundedWriterAdmission(admin, schema);
 
             using (var database = new Database()) {
                 Assert.Equal((606, 70, -606), database.GetLastEntityCoordsLog("page-target"));
@@ -134,7 +136,9 @@ public sealed class Postgres17IntegrationTests {
 
     private static Dictionary<string, string?> CaptureProcessSettings() {
         var values = new Dictionary<string, string?>(StringComparer.Ordinal);
-        foreach (string key in RequiredSettings.Append("DB_SCHEMA")) values[key] = Environment.GetEnvironmentVariable(key);
+        foreach (string key in RequiredSettings.Concat(OptionalConnectionSettings).Append("DB_SCHEMA")) {
+            values[key] = Environment.GetEnvironmentVariable(key);
+        }
         return values;
     }
 
@@ -144,7 +148,9 @@ public sealed class Postgres17IntegrationTests {
 
     private static Dictionary<string, string> LoadSettings() {
         var values = new Dictionary<string, string?>(StringComparer.Ordinal);
-        foreach (string key in RequiredSettings) values[key] = Environment.GetEnvironmentVariable(key);
+        foreach (string key in RequiredSettings.Concat(OptionalConnectionSettings)) {
+            values[key] = Environment.GetEnvironmentVariable(key);
+        }
 
         const string dotEnvPath = "/opt/app/.env";
         if (File.Exists(dotEnvPath)) {
@@ -169,11 +175,19 @@ public sealed class Postgres17IntegrationTests {
             }
             requiredValues[key] = value;
         }
+        foreach (string key in OptionalConnectionSettings) {
+            if (values.TryGetValue(key, out string? value) && !string.IsNullOrWhiteSpace(value)) {
+                requiredValues[key] = value;
+            }
+        }
         return requiredValues;
     }
 
     private static void SetProcessSettings(Dictionary<string, string> settings, string schema) {
         foreach (string key in RequiredSettings) Environment.SetEnvironmentVariable(key, settings[key]);
+        foreach (string key in OptionalConnectionSettings) {
+            Environment.SetEnvironmentVariable(key, settings.TryGetValue(key, out string? value) ? value : null);
+        }
         Environment.SetEnvironmentVariable("DB_SCHEMA", schema);
     }
 
@@ -183,8 +197,14 @@ public sealed class Postgres17IntegrationTests {
             Port = int.Parse(settings["DB_PORT"]),
             Database = settings["DB_NAME"],
             Username = settings["DB_USER"],
-            Password = settings["DB_PASSWORD"]
+            Password = settings["DB_PASSWORD"],
+            SslMode = settings.TryGetValue("DB_SSL_MODE", out string? sslMode)
+                ? DatabaseConfiguration.ParseSslMode(sslMode)
+                : SslMode.Prefer
         };
+        if (settings.TryGetValue("DB_SSL_ROOT_CERTIFICATE", out string? rootCertificate)) {
+            builder.RootCertificate = rootCertificate;
+        }
         return NpgsqlDataSource.Create(builder.ConnectionString);
     }
 
@@ -237,6 +257,20 @@ public sealed class Postgres17IntegrationTests {
 
             await CreateSchema(admin, shapeSchema);
             SetProcessSettings(settings, shapeSchema);
+            using (var database = new Database()) { }
+            await ExecuteInSchema(admin, shapeSchema,
+                "ALTER TABLE blockmutationlogs DROP CONSTRAINT ck_blockmutationlogs_envelope_data_length");
+            using (var migratedDatabase = new Database()) { }
+            await ExecuteInSchema(admin, shapeSchema, $@"ALTER TABLE blockmutationlogs
+                DROP CONSTRAINT ck_blockmutationlogs_envelope_data_length,
+                ADD CONSTRAINT ck_blockmutationlogs_envelope_data_length
+                CHECK (octet_length(envelope_data) <= {BlockStateEnvelope.MaximumEncodedBytes + 1})");
+            error = Assert.Throws<InvalidOperationException>(() => new Database());
+            Assert.Contains("check constraint ck_blockmutationlogs_envelope_data_length has an incompatible definition",
+                error.Message, StringComparison.Ordinal);
+
+            await DropSchema(admin, shapeSchema);
+            await CreateSchema(admin, shapeSchema);
             using (var database = new Database()) { }
             await ExecuteInSchema(admin, shapeSchema, "ALTER TABLE blockmutationlogs DROP CONSTRAINT ck_blockmutationlogs_entry_kind");
             error = Assert.Throws<InvalidOperationException>(() => new Database());
@@ -376,7 +410,8 @@ public sealed class Postgres17IntegrationTests {
         }
         string[] checks = [
             "ck_blockmutationlogs_timestamp", "ck_blockmutationlogs_entry_kind", "ck_blockmutationlogs_action_kind",
-            "ck_blockmutationlogs_envelope_encoding", "ck_blockmutationlogs_rollback_outcome",
+            "ck_blockmutationlogs_envelope_encoding", "ck_blockmutationlogs_envelope_data_length",
+            "ck_blockmutationlogs_rollback_outcome",
             "ck_blockmutationlogs_failure_code_length", "ck_blockmutationlogs_failure_code_format", "ck_blockmutationlogs_entry_action_pair",
             "ck_blockmutationlogs_rollback_fields", "ck_blockmutationlogs_outcome_failure_pair",
             "ck_blockmutationlogs_source_precedes"
@@ -388,6 +423,20 @@ public sealed class Postgres17IntegrationTests {
             Assert.False(constraint.Deferrable);
             Assert.StartsWith("CHECK (", constraint.Definition, StringComparison.Ordinal);
         });
+        Assert.Contains(BlockStateEnvelope.MaximumEncodedBytes.ToString(),
+            constraintRows["ck_blockmutationlogs_envelope_data_length"].Definition, StringComparison.Ordinal);
+
+        await using (NpgsqlCommand oversizedEnvelope = connection.CreateCommand()) {
+            oversizedEnvelope.CommandText = $@"INSERT INTO {QuoteIdentifier(schema)}.blockmutationlogs
+                (timestamp_utc, entry_kind, action_kind, dimension, x, y, z, envelope_data, envelope_encoding)
+                VALUES (1, 0, 1, 0, 0, 0, 0, decode(repeat('00', @byte_length), 'hex'), 1);";
+            oversizedEnvelope.Parameters.AddWithValue("byte_length", NpgsqlDbType.Integer,
+                BlockStateEnvelope.MaximumEncodedBytes + 1);
+            PostgresException oversizedError = await Assert.ThrowsAsync<PostgresException>(async () =>
+                await oversizedEnvelope.ExecuteNonQueryAsync());
+            Assert.Equal(PostgresErrorCodes.CheckViolation, oversizedError.SqlState);
+            Assert.Equal("ck_blockmutationlogs_envelope_data_length", oversizedError.ConstraintName);
+        }
 
         await using NpgsqlCommand indexes = connection.CreateCommand();
         indexes.CommandText = "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = @schema";
@@ -504,8 +553,8 @@ public sealed class Postgres17IntegrationTests {
         Task<long> firstFailedBarrier = database.GetDurableMutationCutoffAsync();
         Task<long> secondFailedBarrier = database.GetDurableMutationCutoffAsync();
         await Assert.ThrowsAsync<PostgresException>(async () => await duplicate);
-        await Assert.ThrowsAsync<InvalidOperationException>(async () => await firstFailedBarrier);
-        await Assert.ThrowsAsync<InvalidOperationException>(async () => await secondFailedBarrier);
+        await Assert.ThrowsAsync<DatabaseWriterUnavailableException>(async () => await firstFailedBarrier);
+        await Assert.ThrowsAsync<DatabaseWriterUnavailableException>(async () => await secondFailedBarrier);
 
         var rollbackOfRollback = new BlockMutationAppend(
             DateTimeOffset.UtcNow.ToUnixTimeSeconds(), null, null,
@@ -513,15 +562,21 @@ public sealed class Postgres17IntegrationTests {
             2, 100, 80, -100, envelope, rollbackId, BlockMutationRollbackOutcome.Failed,
             "source-not-mutation", operatorPlayerUid: "operator-source-check"
         );
-        await Assert.ThrowsAsync<InvalidOperationException>(async () => await database.EnqueueBlockMutationAppend(rollbackOfRollback));
+        var unavailableStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        await Assert.ThrowsAsync<DatabaseWriterUnavailableException>(async () =>
+            await database.EnqueueBlockMutationAppend(rollbackOfRollback));
+        unavailableStopwatch.Stop();
+        Assert.True(unavailableStopwatch.Elapsed < TimeSpan.FromSeconds(1));
         var coordinateMismatch = new BlockMutationAppend(
             DateTimeOffset.UtcNow.ToUnixTimeSeconds(), null, null,
             BlockMutationEntryKind.Rollback, BlockMutationActionKind.Rollback,
             2, 999, 80, -100, inverse, firstId, BlockMutationRollbackOutcome.Skipped,
             "coordinate-mismatch", operatorPlayerUid: "operator-coordinate-check"
         );
-        await Assert.ThrowsAsync<InvalidOperationException>(async () => await database.EnqueueBlockMutationAppend(coordinateMismatch));
-        await Assert.ThrowsAsync<InvalidOperationException>(async () => await database.GetDurableMutationCutoffAsync());
+        await Assert.ThrowsAsync<DatabaseWriterUnavailableException>(async () =>
+            await database.EnqueueBlockMutationAppend(coordinateMismatch));
+        await Assert.ThrowsAsync<DatabaseWriterUnavailableException>(async () =>
+            await database.GetDurableMutationCutoffAsync());
 
         await using (NpgsqlConnection connection = await admin.OpenConnectionAsync()) {
             await using NpgsqlCommand command = connection.CreateCommand();
@@ -617,6 +672,16 @@ public sealed class Postgres17IntegrationTests {
             1005, null, null, BlockMutationEntryKind.Rollback, BlockMutationActionKind.Rollback,
             9, 400, 50, -400, new BlockStateEnvelope(air, stone), breakId,
             BlockMutationRollbackOutcome.Failed, "restore-failed", "Reader Operator", "reader-operator"));
+        long duplicateFailureId = await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1006, null, null, BlockMutationEntryKind.Rollback, BlockMutationActionKind.Rollback,
+            9, 400, 50, -400, new BlockStateEnvelope(air, stone), breakId,
+            BlockMutationRollbackOutcome.Failed, "restore-failed", "Another Operator", "reader-operator-2"));
+        long changedFailureId = await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1007, null, null, BlockMutationEntryKind.Rollback, BlockMutationActionKind.Rollback,
+            9, 400, 50, -400, new BlockStateEnvelope(air, stone), breakId,
+            BlockMutationRollbackOutcome.Failed, "current-state-mismatch", "Reader Operator", "reader-operator"));
+        Assert.NotEqual(failureId, duplicateFailureId);
+        Assert.NotEqual(failureId, changedFailureId);
         long cutoff = await database.GetDurableBlockMutationCutoffAsync();
 
         BlockMutationPlayer player = Assert.IsType<BlockMutationPlayer>(
@@ -646,12 +711,83 @@ public sealed class Postgres17IntegrationTests {
         IReadOnlyList<BlockMutationLogRow> history = await database.ReadBlockMutationHistoryAsync(new BlockMutationHistoryQuery {
             Coordinates = [new BlockMutationCoordinate(9, 400, 50, -400)], MaximumId = cutoff
         });
-        Assert.Equal([failureId, otherId, placeId, breakId], history.Select(row => row.Id));
+        Assert.Equal([changedFailureId, otherId, placeId, breakId], history.Select(row => row.Id));
         BlockMutationLogRow rollback = history[0];
         Assert.Null(rollback.ActorPlayerId);
         Assert.Equal("reader-operator", rollback.OperatorPlayerUid);
         Assert.True(rollback.OperatorPlayerId > int.MaxValue);
         Assert.Equal(new BlockStateEnvelope(air, stone), rollback.Envelope);
+
+        var sizedEnvelope = new BlockStateEnvelope(
+            EnvelopeBlockState.Asset("game:reader-sized", new byte[128 * 1024]), air);
+        long sizedFirstId = await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1006, "Reader Target", "reader-target", BlockMutationEntryKind.Mutation,
+            BlockMutationActionKind.Break, 11, 800, 55, -800, sizedEnvelope));
+        long sizedSecondId = await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1007, "Reader Target", "reader-target", BlockMutationEntryKind.Mutation,
+            BlockMutationActionKind.Break, 11, 800, 55, -800, sizedEnvelope));
+        long exactSizedBudget = checked((long)sizedEnvelope.Encode().Length * 2);
+        var sizedTargetQuery = new BlockMutationTargetQuery {
+            PlayerId = player.Id, Dimension = 11, CenterX = 800, CenterY = 55, CenterZ = -800,
+            Radius = 0, BreakOnly = true, CutoffId = sizedSecondId
+        };
+        Assert.Equal([sizedSecondId, sizedFirstId],
+            (await database.ReadTargetBlockMutationsAsync(sizedTargetQuery, exactSizedBudget)).Select(row => row.Id));
+        BlockRollbackLimitExceededException candidateByteLimit = await Assert.ThrowsAsync<BlockRollbackLimitExceededException>(
+            async () => await database.ReadTargetBlockMutationsAsync(sizedTargetQuery, exactSizedBudget - 1));
+        Assert.Equal("candidate encoded-byte total", candidateByteLimit.LimitName);
+        Assert.Equal(exactSizedBudget - 1, candidateByteLimit.Maximum);
+        BlockMutationCandidatePage bytePage = await database.ReadTargetBlockMutationPageAsync(
+            sizedTargetQuery, 2, exactSizedBudget - 1);
+        Assert.Equal([sizedSecondId], bytePage.Rows.Select(row => row.Id));
+        Assert.True(bytePage.HasMoreCandidates);
+        BlockMutationCandidatePage cursorPage = await database.ReadTargetBlockMutationPageAsync(
+            sizedTargetQuery with { BeforeSourceIdExclusive = sizedSecondId }, 2, exactSizedBudget);
+        Assert.Equal([sizedFirstId], cursorPage.Rows.Select(row => row.Id));
+        Assert.False(cursorPage.HasMoreCandidates);
+
+        var sizedHistoryQuery = new BlockMutationHistoryQuery {
+            Coordinates = [new BlockMutationCoordinate(11, 800, 55, -800)],
+            MaximumId = sizedSecondId
+        };
+        Assert.Equal([sizedSecondId, sizedFirstId],
+            (await database.ReadBlockMutationHistoryAsync(sizedHistoryQuery, exactSizedBudget)).Select(row => row.Id));
+        Assert.Equal([sizedSecondId], (await database.ReadBlockMutationHistoryAsync(
+            sizedHistoryQuery with { MinimumId = sizedSecondId }, exactSizedBudget)).Select(row => row.Id));
+        BlockRollbackLimitExceededException historyByteLimit = await Assert.ThrowsAsync<BlockRollbackLimitExceededException>(
+            async () => await database.ReadBlockMutationHistoryAsync(sizedHistoryQuery, exactSizedBudget - 1));
+        Assert.Equal("history encoded-byte total", historyByteLimit.LimitName);
+        Assert.Equal(exactSizedBudget - 1, historyByteLimit.Maximum);
+
+        var chainFirst = new BlockStateEnvelope(stone, brick);
+        var chainSecond = new BlockStateEnvelope(brick, air);
+        long chainFirstId = await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1010, "Reader Target", "reader-target", BlockMutationEntryKind.Mutation,
+            BlockMutationActionKind.Place, 13, 850, 55, -850, chainFirst));
+        long chainSecondId = await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1011, "Reader Target", "reader-target", BlockMutationEntryKind.Mutation,
+            BlockMutationActionKind.Break, 13, 850, 55, -850, chainSecond));
+        long chainSuccessId = await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
+            1012, null, null, BlockMutationEntryKind.Rollback, BlockMutationActionKind.Rollback,
+            13, 850, 55, -850, new BlockStateEnvelope(air, brick), chainSecondId,
+            BlockMutationRollbackOutcome.Succeeded, operatorPlayerUid: "reader-operator"));
+        var chainQuery = new BlockMutationTargetQuery {
+            PlayerId = player.Id, Dimension = 13, CenterX = 850, CenterY = 55, CenterZ = -850,
+            Radius = 0, CutoffId = chainSecondId
+        };
+        BlockMutationCandidatePage remainingChain = await database.ReadTargetBlockMutationPageAsync(chainQuery);
+        Assert.Equal([chainFirstId], remainingChain.Rows.Select(row => row.Id));
+        IReadOnlyList<BlockMutationLogRow> compactChainHistory = await database.ReadBlockMutationHistoryAsync(
+            new BlockMutationHistoryQuery {
+                Coordinates = [new BlockMutationCoordinate(13, 850, 55, -850)],
+                MinimumId = chainFirstId, MaximumId = chainSuccessId
+            });
+        Assert.Equal([chainFirstId], compactChainHistory.Select(row => row.Id));
+        BlockRollbackPlan resumedChainPlan = BlockRollbackPlanner.Build(new BlockRollbackPlanningRequest {
+            TargetPlayerUid = "reader-target", Dimension = 13, CenterX = 850, CenterY = 55,
+            CenterZ = -850, Radius = 0, CutoffId = chainSecondId, HistoryThroughId = chainSuccessId
+        }, remainingChain.Rows, compactChainHistory);
+        Assert.Equal(BlockRollbackPlanDisposition.Apply, Assert.Single(resumedChainPlan.Entries).Disposition);
 
         await using (NpgsqlConnection connection = await admin.OpenConnectionAsync()) {
             await using NpgsqlCommand explain = connection.CreateCommand();
@@ -674,7 +810,7 @@ public sealed class Postgres17IntegrationTests {
         }
 
         long malformedId = await database.EnqueueBlockMutationAppend(new BlockMutationAppend(
-            1006, "Malformed Reader", "reader-malformed", BlockMutationEntryKind.Mutation,
+            1008, "Malformed Reader", "reader-malformed", BlockMutationEntryKind.Mutation,
             BlockMutationActionKind.Break, 9, 777, 50, -777, broke));
         await using (NpgsqlConnection connection = await admin.OpenConnectionAsync()) {
             await using NpgsqlCommand corrupt = connection.CreateCommand();
@@ -721,6 +857,10 @@ public sealed class Postgres17IntegrationTests {
             (await database.ReadTargetBlockMutationsAsync(boundedQuery)).Count);
         await Assert.ThrowsAsync<BlockRollbackLimitExceededException>(async () =>
             await database.ReadTargetBlockMutationsAsync(boundedQuery with { CutoffId = overLimitMaximumId }));
+        BlockMutationCandidatePage firstPage = await database.ReadTargetBlockMutationPageAsync(
+            boundedQuery with { CutoffId = overLimitMaximumId });
+        Assert.Equal(BlockRollbackLimits.MaximumCandidates, firstPage.Rows.Count);
+        Assert.True(firstPage.HasMoreCandidates);
 
         var disposedReader = new Database();
         disposedReader.Dispose();
@@ -838,9 +978,11 @@ public sealed class Postgres17IntegrationTests {
 
         command.Parameters.Clear();
         command.CommandText = "SELECT count(*) FROM blocklogs WHERE block = 'game:block/drain'";
-        Assert.Equal(120L, Convert.ToInt64(await command.ExecuteScalarAsync()));
+        // The invalid queued container write makes writer failure sticky; later fire-and-forget
+        // work is drained without execution for this database lifetime.
+        Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync()));
         command.CommandText = "SELECT count(*) FROM containerlogs WHERE containerid = 'container-after-failure'";
-        Assert.Equal(1L, Convert.ToInt64(await command.ExecuteScalarAsync()));
+        Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync()));
         command.CommandText = "SELECT count(*) FROM containerlogs WHERE containerid = 'container-invalid'";
         Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync()));
         command.CommandText = "SELECT count(*) FROM blocklogs WHERE block = 'game:block/concurrent'";
@@ -880,6 +1022,42 @@ public sealed class Postgres17IntegrationTests {
             using var database = new Database();
             Assert.Equal(string.Concat(Enumerable.Repeat("compressible-itemstack-", 200)), database.DecompressText(data, 2));
         }
+    }
+
+    private static async Task ExerciseBoundedWriterAdmission(NpgsqlDataSource admin, string schema) {
+        var envelope = new BlockStateEnvelope(EnvelopeBlockState.Asset("game:queue-stone"),
+            EnvelopeBlockState.Air());
+        var database = new Database(2);
+        await using NpgsqlConnection blocker = await admin.OpenConnectionAsync();
+        await using NpgsqlTransaction transaction = await blocker.BeginTransactionAsync();
+        await using (NpgsqlCommand command = blocker.CreateCommand()) {
+            command.Transaction = transaction;
+            command.CommandText = $"SET search_path TO {QuoteIdentifier(schema)}; LOCK TABLE blockmutationlogs IN ACCESS EXCLUSIVE MODE;";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        Task<long> first = database.EnqueueBlockMutationAppend(MutationAppend(envelope, 3001));
+        DateTime deadline = DateTime.UtcNow.AddSeconds(5);
+        while (database.ActiveWriterWorkCount != 1 && DateTime.UtcNow < deadline) await Task.Delay(10);
+        Assert.Equal(1, database.ActiveWriterWorkCount);
+        Assert.Equal(0, database.PendingWriterWorkCount);
+        Task<long> second = database.EnqueueBlockMutationAppend(MutationAppend(envelope, 3002));
+        Task<long> third = database.EnqueueBlockMutationAppend(MutationAppend(envelope, 3003));
+        Assert.Equal(2, database.PendingWriterWorkCount);
+        long rejectedBefore = database.RejectedWriterWorkCount;
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        database.AddBlockLog("Queue", "queue-player", "USED", "game:queue-drop", null, 1, 2, 3, null);
+        stopwatch.Stop();
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(1));
+        Assert.True(database.RejectedWriterWorkCount > rejectedBefore);
+        await Assert.ThrowsAsync<DatabaseWriterQueueFullException>(async () =>
+            await database.EnqueueBlockMutationAppend(MutationAppend(envelope, 3004)));
+
+        Task dispose = Task.Run(database.Dispose);
+        Assert.False(dispose.IsCompleted);
+        await transaction.CommitAsync();
+        await Task.WhenAll(first, second, third);
+        await dispose.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     private static async Task AssertProductionReadQueries(NpgsqlDataSource admin, string schema) {

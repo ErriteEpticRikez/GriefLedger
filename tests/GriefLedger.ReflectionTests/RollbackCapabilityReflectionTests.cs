@@ -224,14 +224,20 @@ public sealed class RollbackCapabilityReflectionTests {
         var position = new BlockPos(123456, 77, -654321, 4);
         BlockMutationAppend? observed = null;
         int appendFailures = 0;
+        int appendCalls = 0;
         using var capture = new BlockMutationCapture(request => {
             observed = request;
-            return Task.FromException<long>(new InvalidOperationException("database failed"));
+            return Interlocked.Increment(ref appendCalls) == 1
+                ? Task.FromException<long>(new InvalidOperationException("database failed"))
+                : Task.FromException<long>(new DatabaseWriterUnavailableException(
+                    new InvalidOperationException("database failed")));
         }, () => 1234, (_, exception) => {
             Assert.IsType<InvalidOperationException>(exception);
             appendFailures++;
         });
         capture.Subscribe();
+        var coordinate = new BlockMutationCoordinate(4, 123456, 77, -654321);
+        using BlockMutationWatch watch = capture.WatchCoordinates([coordinate]);
 
         var context = new PlayerPlacementSeamContext(player, world, position, 1, before);
         RollbackSeams.EmitPlacementStarting(context);
@@ -247,7 +253,16 @@ public sealed class RollbackCapabilityReflectionTests {
         Assert.Equal((4, 123456, 77, -654321), (append.Dimension, append.X, append.Y, append.Z));
         Assert.Equal("game:stone-granite", append.DecodeEnvelope().Before.AssetCode);
         Assert.Equal("game:stone-andesite", append.DecodeEnvelope().After.AssetCode);
-        Assert.Equal(1, capture.GetGeneration(4, 123456, 77, -654321));
+        Assert.Equal(1, watch.GetGeneration(coordinate));
+        Assert.Equal(1, appendFailures);
+
+        var stickyContext = new PlayerPlacementSeamContext(player, world, position, 1, after);
+        RollbackSeams.EmitPlacementStarting(stickyContext);
+        current = before;
+        stickyContext.AfterBlock = before;
+        Assert.True(RollbackSeams.EmitPlacementCompleted(stickyContext, RollbackMutationOutcome.Changed));
+        Assert.Equal(2, watch.GetGeneration(coordinate));
+        Assert.Equal(2, appendCalls);
         Assert.Equal(1, appendFailures);
     }
 
@@ -257,11 +272,13 @@ public sealed class RollbackCapabilityReflectionTests {
         var position = new BlockPos(8, 9, 10, 2);
         using var capture = new BlockMutationCapture(_ => throw new InvalidOperationException("must not append"), () => 1, (_, _) => { });
         capture.Subscribe();
+        var coordinate = new BlockMutationCoordinate(2, 8, 9, 10);
+        using BlockMutationWatch watch = capture.WatchCoordinates([coordinate]);
 
         var unsupported = new PlayerPlacementSeamContext(player, null!, position, 1, null);
         RollbackSeams.EmitPlacementStarting(unsupported);
         Assert.True(RollbackSeams.EmitPlacementCompleted(unsupported, RollbackMutationOutcome.Changed));
-        Assert.Equal(1, capture.GetGeneration(2, 8, 9, 10));
+        Assert.Equal(1, watch.GetGeneration(coordinate));
 
         using (capture.Suppress()) {
             using (capture.Suppress()) {
@@ -270,7 +287,38 @@ public sealed class RollbackCapabilityReflectionTests {
                 Assert.True(RollbackSeams.EmitPlacementCompleted(suppressed, RollbackMutationOutcome.Changed));
             }
         }
-        Assert.Equal(1, capture.GetGeneration(2, 8, 9, 10));
+        Assert.Equal(1, watch.GetGeneration(coordinate));
+    }
+
+    [Fact]
+    public void Operation_scoped_watches_unregister_and_capture_dispose_clears_all_coordinates() {
+        using var capture = new BlockMutationCapture(_ => Task.FromResult(1L), () => 1, (_, _) => { });
+        var coordinate = new BlockMutationCoordinate(0, 1, 2, 3);
+        BlockMutationWatch first = capture.WatchCoordinates([coordinate]);
+        Assert.Equal(1, capture.WatchedCoordinateCount);
+        first.Dispose();
+        Assert.Equal(0, capture.WatchedCoordinateCount);
+
+        using BlockMutationWatch second = capture.WatchCoordinates([coordinate]);
+        Assert.Equal(1, capture.WatchedCoordinateCount);
+        capture.Dispose();
+        Assert.Equal(0, capture.WatchedCoordinateCount);
+    }
+
+    [Fact]
+    public void Chisel_voxel_change_decision_uses_exact_canonical_state_equality() {
+        EnvelopeBlockState before = EnvelopeBlockState.Asset("game:chiseledblock", [1, 2, 3]);
+        EnvelopeBlockState equal = EnvelopeBlockState.Asset("game:chiseledblock", [1, 2, 3]);
+        EnvelopeBlockState different = EnvelopeBlockState.Asset("game:chiseledblock", [1, 2, 4]);
+
+        Assert.Equal(RollbackMutationOutcome.NoChange,
+            BlockEntityChiselUpdateVoxelPatch.DetermineCanonicalOutcome(before, equal));
+        Assert.Equal(RollbackMutationOutcome.Changed,
+            BlockEntityChiselUpdateVoxelPatch.DetermineCanonicalOutcome(before, different));
+        Assert.Equal(RollbackMutationOutcome.Changed,
+            BlockEntityChiselUpdateVoxelPatch.DetermineCanonicalOutcome(null, different));
+        Assert.Equal(RollbackMutationOutcome.Changed,
+            BlockEntityChiselUpdateVoxelPatch.DetermineCanonicalOutcome(before, null));
     }
 
     [Fact]

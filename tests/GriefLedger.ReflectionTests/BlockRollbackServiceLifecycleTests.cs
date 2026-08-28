@@ -41,6 +41,12 @@ public sealed class BlockRollbackServiceLifecycleTests {
 
     [Fact]
     public void Request_and_query_bounds_are_conservative_and_public() {
+        Assert.Equal(64L * 1024 * 1024, BlockRollbackLimits.MaximumEncodedBytesPerRead);
+        var byteLimit = new BlockRollbackLimitExceededException("candidate encoded-byte total",
+            BlockRollbackLimits.MaximumEncodedBytesPerRead);
+        Assert.Equal(BlockRollbackLimits.MaximumEncodedBytesPerRead, byteLimit.Maximum);
+        Assert.Equal("candidate encoded-byte total", byteLimit.LimitName);
+
         BlockRollbackRequest valid = Request() with { Radius = BlockRollbackLimits.MaximumRadius };
         valid.Validate();
         Assert.Throws<ArgumentOutOfRangeException>(() =>
@@ -91,6 +97,53 @@ public sealed class BlockRollbackServiceLifecycleTests {
         Assert.Equal(BlockRollbackFailureCodes.RestoreFailed, result.Attempts[0].FailureCode);
     }
 
+    [Fact]
+    public void Completed_page_reports_older_candidates_without_claiming_an_operation_failure() {
+        var result = new BlockRollbackResult(10, 12, null,
+            [new BlockRollbackAttemptResult(9, BlockMutationRollbackOutcome.Succeeded, null, 13)],
+            totalSelectedSourceCount: 1, hasMoreCandidates: true, continuationBeforeSourceId: 9);
+
+        Assert.True(result.HasMoreCandidates);
+        Assert.Null(result.OperationFailureCode);
+        Assert.Equal(0, result.UnprocessedSourceCount);
+        Assert.Equal(9, result.ContinuationBeforeSourceId);
+    }
+
+    [Fact]
+    public async Task History_limit_adaptively_shrinks_newest_page_and_exposes_continuation() {
+        BlockMutationLogRow[] sources = Enumerable.Range(1, 4)
+            .Select(id => Mutation(id, "target-uid")).OrderByDescending(row => row.Id).ToArray();
+        BlockMutationLogRow laterOther = Mutation(5, "other-uid");
+        var historyQueries = new List<BlockMutationHistoryQuery>();
+        int cutoffReads = 0;
+        int historyReads = 0;
+        int watchDisposals = 0;
+        using var service = new BlockRollbackService(
+            () => Task.FromResult(Interlocked.Increment(ref cutoffReads) == 1 ? 4L : 5L),
+            (_, _) => Task.FromResult<BlockMutationPlayer?>(new BlockMutationPlayer(7, "target-uid", "Target")),
+            (_, _) => Task.FromResult(new BlockMutationCandidatePage(sources, false)),
+            (query, _) => {
+                historyQueries.Add(query);
+                if (Interlocked.Increment(ref historyReads) == 1) {
+                    throw new BlockRollbackLimitExceededException("history encoded-byte total", 1024);
+                }
+                return Task.FromResult<IReadOnlyList<BlockMutationLogRow>>([sources[0], sources[1], laterOther]);
+            },
+            _ => Task.FromResult(100L),
+            _ => new TestWatch(_ => 0, () => Interlocked.Increment(ref watchDisposals)),
+            (action, _) => action());
+
+        BlockRollbackResult result = await service.RollbackAsync(Request());
+
+        Assert.Equal([1L, 3L], historyQueries.Select(query => query.MinimumId));
+        Assert.Equal(2, result.TotalSelectedSourceCount);
+        Assert.Equal(2, result.Attempts.Count);
+        Assert.True(result.HasMoreCandidates);
+        Assert.Equal(3, result.ContinuationBeforeSourceId);
+        Assert.All(result.Attempts, attempt => Assert.Equal(BlockMutationRollbackOutcome.Skipped, attempt.Outcome));
+        Assert.Equal(1, watchDisposals);
+    }
+
     private static BlockRollbackService CreateService(
         Func<string, CancellationToken, Task<BlockMutationPlayer?>>? resolve = null,
         Func<BlockMutationTargetQuery, CancellationToken, Task<IReadOnlyList<BlockMutationLogRow>>>? readTargets = null,
@@ -99,10 +152,11 @@ public sealed class BlockRollbackServiceLifecycleTests {
         return new BlockRollbackService(
             () => Task.FromResult(1L),
             resolve ?? ((_, _) => Task.FromResult<BlockMutationPlayer?>(null)),
-            readTargets ?? ((_, _) => Task.FromResult<IReadOnlyList<BlockMutationLogRow>>(Array.Empty<BlockMutationLogRow>())),
+            async (query, token) => new BlockMutationCandidatePage(
+                await (readTargets ?? ((_, _) => Task.FromResult<IReadOnlyList<BlockMutationLogRow>>(Array.Empty<BlockMutationLogRow>())))(query, token), false),
             (_, _) => Task.FromResult<IReadOnlyList<BlockMutationLogRow>>(Array.Empty<BlockMutationLogRow>()),
             _ => Task.FromResult(1L),
-            generation ?? (_ => 0),
+            _ => new TestWatch(generation ?? (_ => 0)),
             enqueueMain ?? ((_, _) => throw new InvalidOperationException("No main-thread callback was expected.")));
     }
 
@@ -125,10 +179,14 @@ public sealed class BlockRollbackServiceLifecycleTests {
     };
 
     private static BlockMutationLogRow Mutation() {
+        return Mutation(1, "target-uid");
+    }
+
+    private static BlockMutationLogRow Mutation(long id, string actorUid) {
         var envelope = new BlockStateEnvelope(EnvelopeBlockState.Asset("game:stone"), EnvelopeBlockState.Air());
-        return new BlockMutationLogRow(1, 1, 7, BlockMutationEntryKind.Mutation,
+        return new BlockMutationLogRow(id, 1, 7, BlockMutationEntryKind.Mutation,
             BlockMutationActionKind.Break, 0, 0, 0, 0, envelope.Encode(), 1,
-            null, null, null, null, "target-uid", "Target");
+            null, null, null, null, actorUid, "Target");
     }
 
     private sealed class OversizedList<T>(int count) : IReadOnlyList<T> {
@@ -136,5 +194,10 @@ public sealed class BlockRollbackServiceLifecycleTests {
         public T this[int index] => throw new InvalidOperationException("The oversized list must not be enumerated.");
         public IEnumerator<T> GetEnumerator() => throw new InvalidOperationException("The oversized list must not be enumerated.");
         System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    private sealed class TestWatch(Func<BlockMutationCoordinate, long> generation, Action? dispose = null) : IBlockMutationWatch {
+        public long GetGeneration(BlockMutationCoordinate coordinate) => generation(coordinate);
+        public void Dispose() => dispose?.Invoke();
     }
 }

@@ -31,7 +31,7 @@ For every stored row, inspect that `dimension`, absolute `x/y/z`, actor UID/name
 `domain:path` asset codes, and before/after TreeAttribute bytes match the live state. For chisel
 payloads, parse the tree and confirm `materials` is a string array, `posy` is the original
 `BlockPos.InternalY`, and no `decorIds`, `decorRot`, or `beams` field is present. Also force one
-database append failure and confirm a single server-log error occurs without interrupting gameplay.
+database append failure and confirm the first failure produces one server-log error without interrupting gameplay; subsequent captures rejected by the sticky unavailable writer state must not flood one error per event.
 
 ## Guarded replay verification
 

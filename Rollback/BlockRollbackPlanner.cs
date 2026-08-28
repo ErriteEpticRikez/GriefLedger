@@ -11,17 +11,18 @@ public static class BlockRollbackLimits {
     public const int MaximumCandidates = 10_000;
     public const int MaximumUniqueCoordinates = 10_000;
     public const int MaximumHistoryRows = 200_000;
+    public const long MaximumEncodedBytesPerRead = 64L * 1024 * 1024;
 }
 
 public sealed class BlockRollbackLimitExceededException : InvalidOperationException {
-    public BlockRollbackLimitExceededException(string limitName, int maximum)
+    public BlockRollbackLimitExceededException(string limitName, long maximum)
         : base($"The rollback request exceeded {limitName} ({maximum}).") {
         LimitName = limitName;
         Maximum = maximum;
     }
 
     public string LimitName { get; }
-    public int Maximum { get; }
+    public long Maximum { get; }
 }
 
 public enum BlockRollbackPlanDisposition {
@@ -115,6 +116,7 @@ public static class BlockRollbackPlanner {
             throw new InvalidDataException("The rollback candidate set contains duplicate ledger ids.");
         }
         var selectedIds = orderedCandidates.Select(row => row.Id).ToHashSet();
+        long minimumSelectedId = orderedCandidates.Length == 0 ? 0 : orderedCandidates[^1].Id;
         if (orderedCandidates.Select(row => row.Coordinate).Distinct().Count() > BlockRollbackLimits.MaximumUniqueCoordinates) {
             throw new BlockRollbackLimitExceededException("unique coordinate count", BlockRollbackLimits.MaximumUniqueCoordinates);
         }
@@ -139,13 +141,17 @@ public static class BlockRollbackPlanner {
 
         foreach (BlockMutationLogRow row in history.Where(value => value.EntryKind == BlockMutationEntryKind.Rollback)) {
             if (!row.SourceMutationId.HasValue
-                || !historyById.TryGetValue(row.SourceMutationId.Value, out BlockMutationLogRow? source)
-                || source.EntryKind != BlockMutationEntryKind.Mutation || source.Coordinate != row.Coordinate) {
+                || row.SourceMutationId.Value >= minimumSelectedId
+                    && (!historyById.TryGetValue(row.SourceMutationId.Value, out BlockMutationLogRow? boundedSource)
+                        || boundedSource.EntryKind != BlockMutationEntryKind.Mutation
+                        || boundedSource.Coordinate != row.Coordinate)) {
                 throw new InvalidDataException("A rollback history row does not link to its exact source mutation.");
             }
-            var exactInverse = new BlockStateEnvelope(source.Envelope.After, source.Envelope.Before);
-            if (!row.Envelope.Equals(exactInverse)) {
-                throw new InvalidDataException("A rollback history row is not the exact inverse of its source mutation.");
+            if (historyById.TryGetValue(row.SourceMutationId.Value, out BlockMutationLogRow? source)) {
+                var exactInverse = new BlockStateEnvelope(source.Envelope.After, source.Envelope.Before);
+                if (!row.Envelope.Equals(exactInverse)) {
+                    throw new InvalidDataException("A rollback history row is not the exact inverse of its source mutation.");
+                }
             }
         }
 
@@ -186,6 +192,14 @@ public static class BlockRollbackPlanner {
                 && row.RollbackOutcome == BlockMutationRollbackOutcome.Succeeded)
             .GroupBy(row => row.SourceMutationId!.Value)
             .ToDictionary(group => group.Key, group => group.Max(row => row.Id));
+        var successfullyUnwoundSources = new HashSet<long>();
+        foreach ((long sourceId, _) in latestSuccessfulOutcomeIds) {
+            if (historyById.TryGetValue(sourceId, out BlockMutationLogRow? source)
+                && string.Equals(source.ActorPlayerUid, request.TargetPlayerUid, StringComparison.Ordinal)
+                && request.Selects(source.ActionKind)) {
+                successfullyUnwoundSources.Add(sourceId);
+            }
+        }
         EnvelopeBlockState? earliestTransitionBefore = null;
         string? blocker = null;
         long greatestFailedSourceId = 0;
@@ -205,6 +219,13 @@ public static class BlockRollbackPlanner {
             }
 
             if (row.EntryKind == BlockMutationEntryKind.Mutation) {
+                // A durable successful inverse is the transition which now participates in world
+                // history. Its source mutation is consumed, even when paging excluded that source
+                // from this invocation's attempt set.
+                if (successfullyUnwoundSources.Contains(row.Id)) {
+                    PrependTransition(row.Envelope, ref earliestTransitionBefore, ref blocker);
+                    continue;
+                }
                 if (!string.Equals(row.ActorPlayerUid, request.TargetPlayerUid, StringComparison.Ordinal)) {
                     blocker ??= BlockRollbackFailureCodes.LaterOtherPlayer;
                 }
@@ -219,7 +240,7 @@ public static class BlockRollbackPlanner {
 
             if (row.RollbackOutcome == BlockMutationRollbackOutcome.Succeeded) {
                 long sourceId = row.SourceMutationId!.Value;
-                if (!selectedIds.Contains(sourceId)
+                if (!successfullyUnwoundSources.Contains(sourceId)
                     || !historyById.TryGetValue(sourceId, out BlockMutationLogRow? source)
                     || !string.Equals(source.ActorPlayerUid, request.TargetPlayerUid, StringComparison.Ordinal)
                     || !request.Selects(source.ActionKind)) {

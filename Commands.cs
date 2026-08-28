@@ -20,8 +20,8 @@ public class Commands : IDisposable {
     public Commands() {
         Main.API.Permissions.RegisterPrivilege("griefledger", "Use GriefLedger commands.", true);
 
-        Main.API.RegisterCommand("rollbackbreaks", "Exactly revert captured block breaks by a player within a radius (default: 5).", "(-u PLAYERUID | -p USERNAME) -r #", new ServerChatCommandDelegate(this.OnRollbackBreaksCommand), "griefledger");
-        Main.API.RegisterCommand("rollbackblocks", "Exactly revert captured block breaks, placements, and vanilla chisel mutations by a player within a radius (default: 5).", "(-u PLAYERUID | -p USERNAME) -r #", new ServerChatCommandDelegate(this.OnRollbackBlocksCommand), "griefledger");
+        Main.API.RegisterCommand("rollbackbreaks", "Exactly revert captured block breaks by a player within a radius (default: 5).", "(-u PLAYERUID | -p USERNAME) -r # [-b BEFORE_SOURCE_ID]", new ServerChatCommandDelegate(this.OnRollbackBreaksCommand), "griefledger");
+        Main.API.RegisterCommand("rollbackblocks", "Exactly revert captured block breaks, placements, and vanilla chisel mutations by a player within a radius (default: 5).", "(-u PLAYERUID | -p USERNAME) -r # [-b BEFORE_SOURCE_ID]", new ServerChatCommandDelegate(this.OnRollbackBlocksCommand), "griefledger");
         Main.API.RegisterCommand("blocklog", "Inspect block logs at the looked-at block, or around you when a radius is supplied.", "-r # -p #", new ServerChatCommandDelegate(this.OnBlockLogCommand), "griefledger");
         Main.API.RegisterCommand("entitylog", "Inspect entity logs around you or for an entity ID.", "(-r # OR -e ENTITYID) -p #", new ServerChatCommandDelegate(this.OnEntityLogCommand), "griefledger");
         Main.API.RegisterCommand("containerlog", "Inspect logs for the looked-at container.", "-p #", new ServerChatCommandDelegate(this.OnContainerLogCommand), "griefledger");
@@ -52,14 +52,21 @@ public class Commands : IDisposable {
             return;
         }
 
-        // AsBlockPos preserves the entity's dimension and local Y reconstructed from InternalY.
-        // Do not use ToLocalPosition(): that is spawn-relative and dimension-unaware.
-        BlockPos center = player.Entity.Pos.AsBlockPos;
+        Entity? operatorEntity;
+        try { operatorEntity = player.Entity; }
+        catch { operatorEntity = null; }
+        if (!TryGetExactRollbackCenter(operatorEntity, out BlockPos? center)) {
+            Send(player, groupId,
+                "Exact rollback requires an in-world player position and cannot be run from the server console.",
+                EnumChatType.CommandError);
+            return;
+        }
+
         BlockRollbackService service = Main.ExactBlockRollbackService;
         string operatorUid = player.PlayerUID;
         string? operatorName = player.PlayerName;
         Send(player, groupId, "Exact rollback queued; the server will report the guarded replay result here.", EnumChatType.Notification);
-        _ = ObserveExactRollbackAsync(service, player, groupId, operatorUid, operatorName, center, options!, breakOnly);
+        _ = ObserveExactRollbackAsync(service, player, groupId, operatorUid, operatorName, center!, options!, breakOnly);
     }
 
     private async Task ObserveExactRollbackAsync(BlockRollbackService service, IServerPlayer player, int groupId,
@@ -76,7 +83,8 @@ public class Commands : IDisposable {
                 CenterY = center.Y,
                 CenterZ = center.Z,
                 Radius = options.Radius,
-                BreakOnly = breakOnly
+                BreakOnly = breakOnly,
+                BeforeSourceIdExclusive = options.BeforeSourceIdExclusive
             };
             BlockRollbackResult result = await service.RequestAsync(request, lifetimeCancellation.Token).ConfigureAwait(false);
             if (result.OperationFailureCode == BlockRollbackFailureCodes.BatchStopped
@@ -89,9 +97,22 @@ public class Commands : IDisposable {
                 Send(player, groupId, "Exact rollback did not run (" + result.OperationFailureCode + "). "
                     + FormatExactRollbackResult(result), EnumChatType.CommandError);
             }
-            else {
+            else if (result.HasMoreCandidates) {
+                string guidance = result.ContinuationBeforeSourceId.HasValue
+                    ? "Rerun the same command and add -b "
+                        + result.ContinuationBeforeSourceId.Value.ToString(CultureInfo.InvariantCulture) + ". "
+                    : "No continuation cursor was returned; do not treat this page as complete. ";
+                Send(player, groupId, "Exact rollback incomplete: this page was processed, but older eligible sources remain. "
+                    + guidance
+                    + FormatExactRollbackResult(result), EnumChatType.Notification);
+            }
+            else if (IsCleanExactRollbackCompletion(result)) {
                 Send(player, groupId, "Exact rollback complete. " + FormatExactRollbackResult(result),
-                    result.FailedSourceIds.Count == 0 ? EnumChatType.CommandSuccess : EnumChatType.Notification);
+                    EnumChatType.CommandSuccess);
+            }
+            else {
+                Send(player, groupId, "Exact rollback page processed with failed or skipped sources still unresolved. "
+                    + FormatExactRollbackResult(result), EnumChatType.Notification);
             }
         }
         catch (BlockRollbackOperationalException exception) {
@@ -144,7 +165,20 @@ public class Commands : IDisposable {
             + "; succeeded=" + result.SucceededSourceIds.Count.ToString(CultureInfo.InvariantCulture)
             + ", failed=" + result.FailedSourceIds.Count.ToString(CultureInfo.InvariantCulture)
             + ", skipped=" + result.SkippedSourceIds.Count.ToString(CultureInfo.InvariantCulture)
+            + "; has-more-candidates=" + result.HasMoreCandidates.ToString().ToLowerInvariant()
+            + (result.ContinuationBeforeSourceId.HasValue
+                ? ", continuation-before=#" + result.ContinuationBeforeSourceId.Value.ToString(CultureInfo.InvariantCulture)
+                : string.Empty)
             + "; reasons: " + reasons + ".";
+    }
+
+    internal static bool IsCleanExactRollbackCompletion(BlockRollbackResult result) {
+        ArgumentNullException.ThrowIfNull(result);
+        return result.OperationFailureCode == null
+            && !result.HasMoreCandidates
+            && result.UnprocessedSourceCount == 0
+            && result.FailedSourceIds.Count == 0
+            && result.SkippedSourceIds.Count == 0;
     }
 
     private void Send(IServerPlayer player, int groupId, string message, EnumChatType type) {
@@ -177,6 +211,21 @@ public class Commands : IDisposable {
         catch (Exception exception) {
             try { reportFailure(exception); }
             catch { /* Reporting a stale API must not throw from the server task either. */ }
+        }
+    }
+
+    internal static bool TryGetExactRollbackCenter(Entity? entity, out BlockPos? center) {
+        center = null;
+        if (entity == null) return false;
+        try {
+            // AsBlockPos preserves the entity's dimension and local Y reconstructed from
+            // InternalY. ToLocalPosition is spawn-relative and dimension-unaware.
+            center = entity.Pos?.AsBlockPos;
+            return center != null;
+        }
+        catch {
+            center = null;
+            return false;
         }
     }
 
@@ -350,7 +399,12 @@ public class Commands : IDisposable {
 }
 
 /// <summary>Strict, side-effect-free parser for the two exact rollback commands.</summary>
-internal sealed record ExactRollbackCommandOptions(string? PlayerUid, string? PlayerName, int Radius);
+internal sealed record ExactRollbackCommandOptions(
+    string? PlayerUid,
+    string? PlayerName,
+    int Radius,
+    long? BeforeSourceIdExclusive
+);
 
 internal sealed class ExactRollbackCommandException : Exception {
     internal ExactRollbackCommandException(string message) : base(message) { }
@@ -364,11 +418,13 @@ internal static class ExactRollbackCommandParser {
         string? playerName = null;
         int radius = Commands.DefaultExactRollbackRadius;
         bool radiusSpecified = false;
+        long? beforeSourceIdExclusive = null;
         for (int index = 0; index < words.Count; index++) {
             string flag = words[index] ?? string.Empty;
-            if (flag is not "-u" and not "-p" and not "-r") {
+            if (flag is not "-u" and not "-p" and not "-r" and not "-b") {
                 options = null;
-                error = "Unknown rollback option '" + flag + "'. Usage: (-u PLAYERUID | -p USERNAME) -r #.";
+                error = "Unknown rollback option '" + flag
+                    + "'. Usage: (-u PLAYERUID | -p USERNAME) -r # [-b BEFORE_SOURCE_ID].";
                 return false;
             }
             if (++index >= words.Count || string.IsNullOrWhiteSpace(words[index])) {
@@ -409,6 +465,20 @@ internal static class ExactRollbackCommandParser {
                     }
                     radiusSpecified = true;
                     break;
+                case "-b":
+                    if (beforeSourceIdExclusive.HasValue) {
+                        options = null;
+                        error = "Specify -b only once.";
+                        return false;
+                    }
+                    if (!long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture,
+                            out long parsedBeforeSourceId) || parsedBeforeSourceId <= 0) {
+                        options = null;
+                        error = "Before-source ID must be a positive integer copied from the prior page result.";
+                        return false;
+                    }
+                    beforeSourceIdExclusive = parsedBeforeSourceId;
+                    break;
             }
         }
         if ((playerUid == null && playerName == null) || (playerUid != null && playerName != null)) {
@@ -416,7 +486,7 @@ internal static class ExactRollbackCommandParser {
             error = "Specify exactly one target: -u PLAYERUID (recommended) or -p USERNAME.";
             return false;
         }
-        options = new ExactRollbackCommandOptions(playerUid, playerName, radius);
+        options = new ExactRollbackCommandOptions(playerUid, playerName, radius, beforeSourceIdExclusive);
         error = null;
         return true;
     }

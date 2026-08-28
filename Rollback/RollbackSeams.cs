@@ -126,8 +126,8 @@ public sealed class ChiselVoxelSeamContext {
     public Vec3i VoxelPosition { get; }
     public BlockFacing Facing { get; }
     public bool IsBreak { get; }
-    public ulong? BeforeFingerprint { get; internal set; }
-    public ulong? AfterFingerprint { get; internal set; }
+    internal EnvelopeBlockState? BeforeCanonicalState { get; set; }
+    internal EnvelopeBlockState? AfterCanonicalState { get; set; }
     public RollbackMutationOutcome Outcome { get; private set; } = RollbackMutationOutcome.Pending;
     public string? FailureCode { get; private set; }
 

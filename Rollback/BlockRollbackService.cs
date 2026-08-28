@@ -21,11 +21,13 @@ public sealed record BlockRollbackRequest {
     public int CenterZ { get; init; }
     public int Radius { get; init; }
     public bool BreakOnly { get; init; }
+    public long? BeforeSourceIdExclusive { get; init; }
 
     internal void Validate() {
         if (string.IsNullOrWhiteSpace(OperatorPlayerUid)) throw new ArgumentException("A nonempty immutable operator UID is required.", nameof(OperatorPlayerUid));
         if (string.IsNullOrWhiteSpace(TargetPlayerUid)) throw new ArgumentException("A nonempty immutable target UID is required.", nameof(TargetPlayerUid));
         if (Radius is < 0 or > BlockRollbackLimits.MaximumRadius) throw new ArgumentOutOfRangeException(nameof(Radius));
+        if (BeforeSourceIdExclusive is <= 0) throw new ArgumentOutOfRangeException(nameof(BeforeSourceIdExclusive));
     }
 }
 
@@ -38,7 +40,8 @@ public sealed record BlockRollbackAttemptResult(
 
 public sealed class BlockRollbackResult {
     internal BlockRollbackResult(long cutoffId, long historyThroughId, string? operationFailureCode,
-        IReadOnlyList<BlockRollbackAttemptResult> attempts, int? totalSelectedSourceCount = null) {
+        IReadOnlyList<BlockRollbackAttemptResult> attempts, int? totalSelectedSourceCount = null,
+        bool hasMoreCandidates = false, long? continuationBeforeSourceId = null) {
         ArgumentNullException.ThrowIfNull(attempts);
         int selectedCount = totalSelectedSourceCount ?? attempts.Count;
         if (selectedCount < attempts.Count) {
@@ -51,6 +54,8 @@ public sealed class BlockRollbackResult {
         Attempts = attempts;
         TotalSelectedSourceCount = selectedCount;
         UnprocessedSourceCount = selectedCount - attempts.Count;
+        HasMoreCandidates = hasMoreCandidates;
+        ContinuationBeforeSourceId = continuationBeforeSourceId;
         var counts = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (BlockRollbackAttemptResult attempt in attempts) {
             string key = attempt.FailureCode ?? "succeeded";
@@ -71,6 +76,8 @@ public sealed class BlockRollbackResult {
     public IReadOnlyList<BlockRollbackAttemptResult> Attempts { get; }
     public int TotalSelectedSourceCount { get; }
     public int UnprocessedSourceCount { get; }
+    public bool HasMoreCandidates { get; }
+    public long? ContinuationBeforeSourceId { get; }
     public IReadOnlyDictionary<string, int> ReasonCounts { get; }
     public IReadOnlyList<long> SucceededSourceIds { get; }
     public IReadOnlyList<long> FailedSourceIds { get; }
@@ -97,11 +104,11 @@ public sealed class BlockRollbackService : IDisposable {
     private readonly System.Func<Task<long>> getDurableCutoffAsync;
     private readonly System.Func<string, CancellationToken, Task<BlockMutationPlayer?>> resolvePlayerByUidAsync;
     private readonly System.Func<BlockMutationTargetQuery, CancellationToken,
-        Task<IReadOnlyList<BlockMutationLogRow>>> readTargetMutationsAsync;
+        Task<BlockMutationCandidatePage>> readTargetMutationPageAsync;
     private readonly System.Func<BlockMutationHistoryQuery, CancellationToken,
         Task<IReadOnlyList<BlockMutationLogRow>>> readHistoryAsync;
     private readonly System.Func<BlockMutationAppend, Task<long>> enqueueAppendAsync;
-    private readonly System.Func<BlockMutationCoordinate, long> getCaptureGeneration;
+    private readonly System.Func<IReadOnlyCollection<BlockMutationCoordinate>, IBlockMutationWatch> watchCoordinates;
     private readonly System.Action<Action, string> enqueueMainThreadTask;
     private readonly CancellationTokenSource lifetimeCancellation = new();
     private readonly object lifecycleLock = new();
@@ -113,27 +120,27 @@ public sealed class BlockRollbackService : IDisposable {
         this.capture = capture ?? throw new ArgumentNullException(nameof(capture));
         getDurableCutoffAsync = database.GetDurableBlockMutationCutoffAsync;
         resolvePlayerByUidAsync = database.ResolveBlockMutationPlayerByUidAsync;
-        readTargetMutationsAsync = database.ReadTargetBlockMutationsAsync;
+        readTargetMutationPageAsync = database.ReadTargetBlockMutationPageAsync;
         readHistoryAsync = database.ReadBlockMutationHistoryAsync;
         enqueueAppendAsync = database.EnqueueBlockMutationAppendAsync;
-        getCaptureGeneration = capture.GetGeneration;
+        watchCoordinates = coordinates => capture.WatchCoordinates(coordinates);
         enqueueMainThreadTask = (action, code) => api.Event.EnqueueMainThreadTask(action, code);
     }
 
     internal BlockRollbackService(
         System.Func<Task<long>> getDurableCutoffAsync,
         System.Func<string, CancellationToken, Task<BlockMutationPlayer?>> resolvePlayerByUidAsync,
-        System.Func<BlockMutationTargetQuery, CancellationToken, Task<IReadOnlyList<BlockMutationLogRow>>> readTargetMutationsAsync,
+        System.Func<BlockMutationTargetQuery, CancellationToken, Task<BlockMutationCandidatePage>> readTargetMutationPageAsync,
         System.Func<BlockMutationHistoryQuery, CancellationToken, Task<IReadOnlyList<BlockMutationLogRow>>> readHistoryAsync,
         System.Func<BlockMutationAppend, Task<long>> enqueueAppendAsync,
-        System.Func<BlockMutationCoordinate, long> getCaptureGeneration,
+        System.Func<IReadOnlyCollection<BlockMutationCoordinate>, IBlockMutationWatch> watchCoordinates,
         System.Action<Action, string> enqueueMainThreadTask) {
         this.getDurableCutoffAsync = getDurableCutoffAsync ?? throw new ArgumentNullException(nameof(getDurableCutoffAsync));
         this.resolvePlayerByUidAsync = resolvePlayerByUidAsync ?? throw new ArgumentNullException(nameof(resolvePlayerByUidAsync));
-        this.readTargetMutationsAsync = readTargetMutationsAsync ?? throw new ArgumentNullException(nameof(readTargetMutationsAsync));
+        this.readTargetMutationPageAsync = readTargetMutationPageAsync ?? throw new ArgumentNullException(nameof(readTargetMutationPageAsync));
         this.readHistoryAsync = readHistoryAsync ?? throw new ArgumentNullException(nameof(readHistoryAsync));
         this.enqueueAppendAsync = enqueueAppendAsync ?? throw new ArgumentNullException(nameof(enqueueAppendAsync));
-        this.getCaptureGeneration = getCaptureGeneration ?? throw new ArgumentNullException(nameof(getCaptureGeneration));
+        this.watchCoordinates = watchCoordinates ?? throw new ArgumentNullException(nameof(watchCoordinates));
         this.enqueueMainThreadTask = enqueueMainThreadTask ?? throw new ArgumentNullException(nameof(enqueueMainThreadTask));
     }
 
@@ -168,7 +175,7 @@ public sealed class BlockRollbackService : IDisposable {
         if (target == null) return new BlockRollbackResult(cutoff, cutoff,
             BlockRollbackFailureCodes.TargetPlayerNotFound, Array.Empty<BlockRollbackAttemptResult>());
 
-        IReadOnlyList<BlockMutationLogRow> candidates = await readTargetMutationsAsync(
+        BlockMutationCandidatePage candidatePage = await readTargetMutationPageAsync(
             new BlockMutationTargetQuery {
                 PlayerId = target.Id,
                 Dimension = request.Dimension,
@@ -177,33 +184,60 @@ public sealed class BlockRollbackService : IDisposable {
                 CenterZ = request.CenterZ,
                 Radius = request.Radius,
                 BreakOnly = request.BreakOnly,
-                CutoffId = cutoff
+                CutoffId = cutoff,
+                BeforeSourceIdExclusive = request.BeforeSourceIdExclusive
             }, cancellationToken).ConfigureAwait(false);
+        IReadOnlyList<BlockMutationLogRow> candidates = candidatePage.Rows;
         if (candidates.Count > BlockRollbackLimits.MaximumCandidates) {
             throw new BlockRollbackLimitExceededException("candidate count", BlockRollbackLimits.MaximumCandidates);
         }
         if (candidates.Count == 0) return new BlockRollbackResult(cutoff, cutoff, null, Array.Empty<BlockRollbackAttemptResult>());
 
-        BlockMutationCoordinate[] coordinates = candidates.Select(row => row.Coordinate).Distinct().ToArray();
-        if (coordinates.Length > BlockRollbackLimits.MaximumUniqueCoordinates) {
+        BlockMutationCoordinate[] watchedCoordinates = candidates.Select(row => row.Coordinate).Distinct().ToArray();
+        if (watchedCoordinates.Length > BlockRollbackLimits.MaximumUniqueCoordinates) {
             throw new BlockRollbackLimitExceededException("unique coordinate count", BlockRollbackLimits.MaximumUniqueCoordinates);
         }
-        IReadOnlyDictionary<BlockMutationCoordinate, long> plannedGenerations = await RunOnMainThreadAsync(() => {
-            var values = new Dictionary<BlockMutationCoordinate, long>();
-            foreach (BlockMutationCoordinate coordinate in coordinates) values[coordinate] = getCaptureGeneration(coordinate);
-            return (IReadOnlyDictionary<BlockMutationCoordinate, long>)new ReadOnlyDictionary<BlockMutationCoordinate, long>(values);
-        }, "griefledger-rollback-generation-snapshot", cancellationToken).ConfigureAwait(false);
+        IBlockMutationWatch? mutationWatch = null;
+        try {
+            mutationWatch = await RunOnMainThreadAsync(() => watchCoordinates(watchedCoordinates),
+                "griefledger-rollback-generation-watch", cancellationToken).ConfigureAwait(false);
 
-        // Any capture completed before the main-thread snapshot queued its append first. This
-        // second FIFO barrier therefore closes the post-selection/pre-snapshot ledger race.
-        long historyThrough = await getDurableCutoffAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
+            // Any capture completed before the main-thread watch registration queued its append
+            // first. This second FIFO barrier therefore closes the pre-registration ledger race;
+            // later player mutations increment only these operation-scoped watch counters.
+            long historyThrough = await getDurableCutoffAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
 
-        IReadOnlyList<BlockMutationLogRow> history = await readHistoryAsync(
-            new BlockMutationHistoryQuery { Coordinates = coordinates, MaximumId = historyThrough }, cancellationToken).ConfigureAwait(false);
-        if (history.Count > BlockRollbackLimits.MaximumHistoryRows) {
-            throw new BlockRollbackLimitExceededException("history row count", BlockRollbackLimits.MaximumHistoryRows);
-        }
-        BlockRollbackPlan plan = BlockRollbackPlanner.Build(new BlockRollbackPlanningRequest {
+            bool hasMoreCandidates = candidatePage.HasMoreCandidates;
+            IReadOnlyList<BlockMutationLogRow> history;
+            long minimumSelectedId;
+            while (true) {
+                cancellationToken.ThrowIfCancellationRequested();
+                BlockMutationCoordinate[] selectedCoordinates = candidates.Select(row => row.Coordinate)
+                    .Distinct().ToArray();
+                minimumSelectedId = candidates.Min(row => row.Id);
+                try {
+                    history = await readHistoryAsync(new BlockMutationHistoryQuery {
+                        Coordinates = selectedCoordinates,
+                        MinimumId = minimumSelectedId,
+                        MaximumId = historyThrough
+                    }, cancellationToken).ConfigureAwait(false);
+                    if (history.Count > BlockRollbackLimits.MaximumHistoryRows) {
+                        throw new BlockRollbackLimitExceededException("history row count",
+                            BlockRollbackLimits.MaximumHistoryRows);
+                    }
+                    break;
+                }
+                catch (BlockRollbackLimitExceededException exception)
+                    when (candidates.Count > 1
+                        && exception.LimitName.StartsWith("history ", StringComparison.Ordinal)) {
+                    // Keep the same watch and second cutoff while narrowing the already ordered
+                    // page. This cannot miss pre-registration or post-registration mutations.
+                    int smallerCount = Math.Max(1, candidates.Count / 2);
+                    candidates = candidates.Take(smallerCount).ToArray();
+                    hasMoreCandidates = true;
+                }
+            }
+            BlockRollbackPlan plan = BlockRollbackPlanner.Build(new BlockRollbackPlanningRequest {
             TargetPlayerUid = request.TargetPlayerUid,
             Dimension = request.Dimension,
             CenterX = request.CenterX,
@@ -215,10 +249,10 @@ public sealed class BlockRollbackService : IDisposable {
             HistoryThroughId = historyThrough
         }, candidates, history);
 
-        var attempts = new List<BlockRollbackAttemptResult>(plan.Entries.Count);
-        var blockedCoordinates = new HashSet<BlockMutationCoordinate>();
-        string? operationFailureCode = null;
-        foreach (BlockRollbackPlanEntry entry in plan.Entries) {
+            var attempts = new List<BlockRollbackAttemptResult>(plan.Entries.Count);
+            var blockedCoordinates = new HashSet<BlockMutationCoordinate>();
+            string? operationFailureCode = null;
+            foreach (BlockRollbackPlanEntry entry in plan.Entries) {
             cancellationToken.ThrowIfCancellationRequested();
             BlockMutationLogRow source = entry.Source;
             if (entry.Disposition == BlockRollbackPlanDisposition.Skip) {
@@ -234,7 +268,7 @@ public sealed class BlockRollbackService : IDisposable {
             }
 
             QueuedWorldAttempt attempt = await RunOnMainThreadAsync(() => {
-                MainThreadApplyResult applied = TryApply(source, plannedGenerations[source.Coordinate]);
+                MainThreadApplyResult applied = TryApply(source, mutationWatch);
                 BlockMutationRollbackOutcome outcome = applied.Succeeded
                     ? BlockMutationRollbackOutcome.Succeeded : BlockMutationRollbackOutcome.Failed;
                 Task<long> auditTask;
@@ -259,8 +293,13 @@ public sealed class BlockRollbackService : IDisposable {
                 break;
             }
         }
-        return new BlockRollbackResult(cutoff, historyThrough, operationFailureCode,
-            attempts.AsReadOnly(), plan.Entries.Count);
+            return new BlockRollbackResult(cutoff, historyThrough, operationFailureCode,
+                attempts.AsReadOnly(), plan.Entries.Count, hasMoreCandidates,
+                hasMoreCandidates ? minimumSelectedId : null);
+        }
+        finally {
+            mutationWatch?.Dispose();
+        }
     }
 
     private Task<long> QueueOutcomeAppend(BlockRollbackRequest request, BlockMutationLogRow source,
@@ -309,12 +348,12 @@ public sealed class BlockRollbackService : IDisposable {
         }
     }
 
-    private MainThreadApplyResult TryApply(BlockMutationLogRow source, long plannedGeneration) {
+    private MainThreadApplyResult TryApply(BlockMutationLogRow source, IBlockMutationWatch mutationWatch) {
         ICoreServerAPI serverApi = api ?? throw new InvalidOperationException("World replay is unavailable in this service instance.");
         BlockMutationCapture mutationCapture = capture
             ?? throw new InvalidOperationException("World replay is unavailable in this service instance.");
         BlockMutationCoordinate coordinate = source.Coordinate;
-        if (getCaptureGeneration(coordinate) != plannedGeneration) {
+        if (mutationWatch.GetGeneration(coordinate) != 0) {
             return MainThreadApplyResult.Failed(BlockRollbackFailureCodes.CaptureGenerationChanged);
         }
 

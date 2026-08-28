@@ -10,15 +10,32 @@ internal static class DatabaseConfiguration {
     private static readonly string[] RequiredKeys = {
         "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"
     };
+    private static readonly string[] OptionalKeys = {
+        "DB_SCHEMA", "DB_SSL_MODE", "DB_SSL_ROOT_CERTIFICATE"
+    };
+    private static readonly IReadOnlyDictionary<string, SslMode> SupportedSslModes =
+        new Dictionary<string, SslMode>(StringComparer.OrdinalIgnoreCase) {
+            ["Disable"] = SslMode.Disable,
+            ["Allow"] = SslMode.Allow,
+            ["Prefer"] = SslMode.Prefer,
+            ["Require"] = SslMode.Require,
+            ["VerifyCA"] = SslMode.VerifyCA,
+            ["VerifyFull"] = SslMode.VerifyFull
+        };
 
     public static NpgsqlDataSource CreateDataSource() => CreateDataSource("/opt/app/.env");
 
     internal static NpgsqlDataSource CreateDataSource(string dotEnvPath) {
+        NpgsqlConnectionStringBuilder builder = CreateConnectionStringBuilder(dotEnvPath);
+        return NpgsqlDataSource.Create(builder.ConnectionString);
+    }
+
+    internal static NpgsqlConnectionStringBuilder CreateConnectionStringBuilder(string dotEnvPath) {
         var settings = new Dictionary<string, string?>(StringComparer.Ordinal);
         foreach (string key in RequiredKeys) {
             settings[key] = Environment.GetEnvironmentVariable(key);
         }
-        settings["DB_SCHEMA"] = Environment.GetEnvironmentVariable("DB_SCHEMA");
+        foreach (string key in OptionalKeys) settings[key] = Environment.GetEnvironmentVariable(key);
 
         LoadMissingSettingsFromDotEnv(settings, dotEnvPath);
 
@@ -36,8 +53,16 @@ internal static class DatabaseConfiguration {
             Port = port,
             Database = database,
             Username = username,
-            Password = password
+            Password = password,
+            // Npgsql's compatibility default permits TLS but can fall back to plaintext.
+            SslMode = SslMode.Prefer
         };
+
+        string? sslMode = settings["DB_SSL_MODE"];
+        if (!string.IsNullOrWhiteSpace(sslMode)) builder.SslMode = ParseSslMode(sslMode);
+
+        string? rootCertificate = settings["DB_SSL_ROOT_CERTIFICATE"];
+        if (!string.IsNullOrWhiteSpace(rootCertificate)) builder.RootCertificate = rootCertificate;
 
         string? schema = settings["DB_SCHEMA"];
         if (!string.IsNullOrWhiteSpace(schema)) {
@@ -47,7 +72,15 @@ internal static class DatabaseConfiguration {
             builder.SearchPath = "\"" + schema.Replace("\"", "\"\"") + "\"";
         }
 
-        return NpgsqlDataSource.Create(builder.ConnectionString);
+        return builder;
+    }
+
+    internal static SslMode ParseSslMode(string value) {
+        if (string.IsNullOrWhiteSpace(value)
+            || !SupportedSslModes.TryGetValue(value.Trim(), out SslMode mode)) {
+            throw new InvalidOperationException("Database configuration contains an invalid DB_SSL_MODE.");
+        }
+        return mode;
     }
 
     private static string RequireSetting(Dictionary<string, string?> settings, string key) {

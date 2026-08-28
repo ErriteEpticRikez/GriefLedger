@@ -13,12 +13,15 @@ public sealed class ExactRollbackCommandTests {
         Assert.Equal("immutable-target", options.PlayerUid);
         Assert.Null(options.PlayerName);
         Assert.Equal(Commands.DefaultExactRollbackRadius, options.Radius);
+        Assert.Null(options.BeforeSourceIdExclusive);
     }
 
     [Theory]
     [InlineData("-p", "Ari", "-u", "uid-ari")]
     [InlineData("-u", "uid-ari", "-r", "257")]
     [InlineData("-p", "Ari", "-r", "-1")]
+    [InlineData("-u", "uid-ari", "-b", "0")]
+    [InlineData("-u", "uid-ari", "-b", "9", "-b", "8")]
     [InlineData("-q", "value")]
     public void Parser_rejects_ambiguous_or_out_of_bounds_input(params string[] words) {
         bool parsed = ExactRollbackCommandParser.TryParse(words, out var options, out var error);
@@ -26,6 +29,16 @@ public sealed class ExactRollbackCommandTests {
         Assert.False(parsed);
         Assert.Null(options);
         Assert.False(string.IsNullOrWhiteSpace(error));
+    }
+
+    [Fact]
+    public void Parser_accepts_the_positive_cursor_from_a_prior_page() {
+        bool parsed = ExactRollbackCommandParser.TryParse(
+            ["-u", "immutable-target", "-b", "9223372036854775807"], out var options, out var error);
+
+        Assert.True(parsed, error);
+        Assert.NotNull(options);
+        Assert.Equal(long.MaxValue, options.BeforeSourceIdExclusive);
     }
 
     [Fact]
@@ -49,8 +62,29 @@ public sealed class ExactRollbackCommandTests {
         ]);
 
         Assert.Equal(
-            "cutoff #41; history through #53; selected=4, processed=4, unprocessed=0; succeeded=1, failed=1, skipped=2; reasons: current-state-mismatch=1, later-other-player=2, succeeded=1.",
+            "cutoff #41; history through #53; selected=4, processed=4, unprocessed=0; succeeded=1, failed=1, skipped=2; has-more-candidates=false; reasons: current-state-mismatch=1, later-other-player=2, succeeded=1.",
             Commands.FormatExactRollbackResult(result));
+        Assert.False(Commands.IsCleanExactRollbackCompletion(result));
+    }
+
+    [Fact]
+    public void Result_format_reports_a_bounded_page_continuation_cursor() {
+        var result = new BlockRollbackResult(41, 53, null, [
+            new BlockRollbackAttemptResult(9, BlockMutationRollbackOutcome.Succeeded, null, 54)
+        ], totalSelectedSourceCount: 1, hasMoreCandidates: true, continuationBeforeSourceId: 9);
+
+        Assert.Contains("has-more-candidates=true, continuation-before=#9",
+            Commands.FormatExactRollbackResult(result));
+        Assert.False(Commands.IsCleanExactRollbackCompletion(result));
+    }
+
+    [Fact]
+    public void Only_a_fully_successful_final_page_is_a_clean_completion() {
+        var result = new BlockRollbackResult(41, 53, null, [
+            new BlockRollbackAttemptResult(9, BlockMutationRollbackOutcome.Succeeded, null, 54)
+        ]);
+
+        Assert.True(Commands.IsCleanExactRollbackCompletion(result));
     }
 
     [Fact]
@@ -77,5 +111,11 @@ public sealed class ExactRollbackCommandTests {
         );
 
         Assert.Same(expected, observed);
+    }
+
+    [Fact]
+    public void Console_caller_without_an_entity_has_no_invented_rollback_center() {
+        Assert.False(Commands.TryGetExactRollbackCenter(null, out var center));
+        Assert.Null(center);
     }
 }

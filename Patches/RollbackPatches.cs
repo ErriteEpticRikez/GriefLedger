@@ -403,10 +403,15 @@ internal static class BlockEntityChiselUpdateVoxelPatch {
             __state = new ChiselVoxelSeamContext(__instance, byPlayer, voxelPos, facing, isBreak);
             RollbackSeams.EmitChiselVoxelStarting(__state);
             try {
-                __state.BeforeFingerprint = Fingerprint(__instance);
+                IWorldAccessor? world = __instance.Api?.World;
+                if (world != null && BlockMutationCapture.TryCaptureState(world, __instance.Pos,
+                    out EnvelopeBlockState before)) {
+                    __state.BeforeCanonicalState = before;
+                }
             }
             catch {
-                RollbackSeams.EmitChiselVoxelCompleted(__state, RollbackMutationOutcome.Failed, "before-fingerprint");
+                // Keep the context pending. The postfix conservatively reports Changed when an
+                // exact comparison is unavailable so active replay watches cannot be bypassed.
             }
         }
         catch {
@@ -418,18 +423,21 @@ internal static class BlockEntityChiselUpdateVoxelPatch {
         if (__state == null || __state.Outcome != RollbackMutationOutcome.Pending) return;
 
         try {
-            __state.AfterFingerprint = Fingerprint(__instance);
-            if (__state.BeforeFingerprint == null) {
-                RollbackSeams.EmitChiselVoxelCompleted(__state, RollbackMutationOutcome.Failed, "capture-incomplete");
-                return;
+            IWorldAccessor? world = __instance.Api?.World;
+            EnvelopeBlockState? after = null;
+            if (world != null && BlockMutationCapture.TryCaptureState(world, __instance.Pos,
+                out EnvelopeBlockState capturedAfter)) {
+                after = capturedAfter;
+                __state.AfterCanonicalState = capturedAfter;
             }
             RollbackSeams.EmitChiselVoxelCompleted(
                 __state,
-                __state.AfterFingerprint == __state.BeforeFingerprint ? RollbackMutationOutcome.NoChange : RollbackMutationOutcome.Changed
+                DetermineCanonicalOutcome(__state.BeforeCanonicalState, after)
             );
         }
         catch {
-            RollbackSeams.EmitChiselVoxelCompleted(__state, RollbackMutationOutcome.Failed, "after-fingerprint");
+            RollbackSeams.EmitChiselVoxelCompleted(__state, RollbackMutationOutcome.Changed,
+                "canonical-state-unavailable");
         }
     }
 
@@ -444,26 +452,7 @@ internal static class BlockEntityChiselUpdateVoxelPatch {
         return ReferenceEquals(left, right) || (left != null && right != null && left.PlayerUID == right.PlayerUID);
     }
 
-    private static ulong Fingerprint(BlockEntityChisel chisel) {
-        const ulong offset = 14695981039346656037UL;
-        const ulong prime = 1099511628211UL;
-        ulong hash = offset;
-
-        unchecked {
-            hash = (hash ^ (uint)(chisel.Api?.World.BlockAccessor.GetBlock(chisel.Pos).Id ?? -1)) * prime;
-            if (chisel.BlockIds != null) {
-                hash = (hash ^ (uint)chisel.BlockIds.Length) * prime;
-                foreach (int blockId in chisel.BlockIds) hash = (hash ^ (uint)blockId) * prime;
-            }
-            if (chisel.VoxelCuboids != null) {
-                hash = (hash ^ (uint)chisel.VoxelCuboids.Count) * prime;
-                foreach (uint cuboid in chisel.VoxelCuboids) hash = (hash ^ cuboid) * prime;
-            }
-            if (chisel.AvailMaterialQuantities != null) {
-                hash = (hash ^ (uint)chisel.AvailMaterialQuantities.Length) * prime;
-                foreach (ushort quantity in chisel.AvailMaterialQuantities) hash = (hash ^ quantity) * prime;
-            }
-        }
-        return hash;
-    }
+    internal static RollbackMutationOutcome DetermineCanonicalOutcome(EnvelopeBlockState? before,
+        EnvelopeBlockState? after) => before != null && after != null && before.Equals(after)
+            ? RollbackMutationOutcome.NoChange : RollbackMutationOutcome.Changed;
 }

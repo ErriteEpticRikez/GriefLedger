@@ -1,5 +1,6 @@
 using System;
-using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,6 +14,33 @@ namespace GriefLedger.Rollback;
 /// <summary>An absolute world coordinate used to detect mutations after a rollback plan is made.</summary>
 public readonly record struct BlockMutationCoordinate(int Dimension, int X, int Y, int Z);
 
+internal interface IBlockMutationWatch : IDisposable {
+    long GetGeneration(BlockMutationCoordinate coordinate);
+}
+
+public sealed class BlockMutationWatch : IBlockMutationWatch {
+    private BlockMutationCapture? owner;
+    private readonly IReadOnlyDictionary<BlockMutationCoordinate, BlockMutationWatchCounter> counters;
+
+    internal BlockMutationWatch(BlockMutationCapture owner,
+        IReadOnlyDictionary<BlockMutationCoordinate, BlockMutationWatchCounter> counters) {
+        this.owner = owner;
+        this.counters = counters;
+    }
+
+    public long GetGeneration(BlockMutationCoordinate coordinate) => counters.TryGetValue(coordinate,
+        out BlockMutationWatchCounter? counter) ? Volatile.Read(ref counter.Generation) : 0;
+
+    public void Dispose() {
+        BlockMutationCapture? value = Interlocked.Exchange(ref owner, null);
+        if (value != null) value.Unregister(this, counters);
+    }
+}
+
+internal sealed class BlockMutationWatchCounter {
+    internal long Generation;
+}
+
 /// <summary>
 /// Captures exact, allowlisted block mutations on the server main thread. The service owns its
 /// seam subscriptions and releases them on dispose so a mod reload cannot retain an old Main.
@@ -22,7 +50,8 @@ public sealed class BlockMutationCapture : IDisposable {
     private readonly System.Func<BlockMutationAppend, Task<long>> append;
     private readonly System.Func<long> utcTimestamp;
     private readonly Action<string, Exception?> logFailure;
-    private readonly ConcurrentDictionary<BlockMutationCoordinate, long> generations = new();
+    private readonly object watchLock = new();
+    private readonly Dictionary<BlockMutationCoordinate, BlockMutationWatchCounter> watchedCoordinates = new();
     private readonly ConditionalWeakTable<object, CapturedBefore> pending = new();
     private int subscribed;
     private int disposed;
@@ -54,15 +83,44 @@ public sealed class BlockMutationCapture : IDisposable {
         return capture;
     }
 
-    /// <summary>Returns the current observed player-mutation generation for an absolute coordinate.</summary>
+    /// <summary>Returns the current generation only while the coordinate is operation-scoped watched.</summary>
     public long GetGeneration(int dimension, int x, int y, int z) {
         return GetGeneration(new BlockMutationCoordinate(dimension, x, y, z));
     }
 
     /// <summary>Returns the current observed player-mutation generation for an absolute coordinate.</summary>
     public long GetGeneration(BlockMutationCoordinate coordinate) {
-        return generations.TryGetValue(coordinate, out long generation) ? generation : 0;
+        lock (watchLock) {
+            return watchedCoordinates.TryGetValue(coordinate, out BlockMutationWatchCounter? counter)
+                ? Volatile.Read(ref counter.Generation) : 0;
+        }
     }
+
+    public BlockMutationWatch WatchCoordinates(IReadOnlyCollection<BlockMutationCoordinate> coordinates) {
+        ArgumentNullException.ThrowIfNull(coordinates);
+        BlockMutationCoordinate[] unique = coordinates.Distinct().ToArray();
+        if (unique.Length > BlockRollbackLimits.MaximumUniqueCoordinates) {
+            throw new BlockRollbackLimitExceededException("unique coordinate count",
+                BlockRollbackLimits.MaximumUniqueCoordinates);
+        }
+        var counters = new Dictionary<BlockMutationCoordinate, BlockMutationWatchCounter>(unique.Length);
+        lock (watchLock) {
+            ObjectDisposedException.ThrowIf(disposed != 0, this);
+            foreach (BlockMutationCoordinate coordinate in unique) {
+                if (watchedCoordinates.ContainsKey(coordinate)) {
+                    throw new InvalidOperationException("A rollback coordinate is already watched by another operation.");
+                }
+            }
+            foreach (BlockMutationCoordinate coordinate in unique) {
+                var counter = new BlockMutationWatchCounter();
+                watchedCoordinates.Add(coordinate, counter);
+                counters.Add(coordinate, counter);
+            }
+        }
+        return new BlockMutationWatch(this, counters);
+    }
+
+    internal int WatchedCoordinateCount { get { lock (watchLock) return watchedCoordinates.Count; } }
 
     /// <summary>
     /// Suppresses new seam paths for the lifetime of the returned token. Tokens are nestable and
@@ -95,16 +153,17 @@ public sealed class BlockMutationCapture : IDisposable {
 
     public void Dispose() {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-        if (Interlocked.Exchange(ref subscribed, 0) == 0) return;
-
-        RollbackSeams.PlayerPlacementStarting -= OnPlacementStarting;
-        RollbackSeams.PlayerPlacementCompleted -= OnPlacementCompleted;
-        RollbackSeams.PlayerBreakStarting -= OnBreakStarting;
-        RollbackSeams.PlayerBreakCompleted -= OnBreakCompleted;
-        RollbackSeams.ChiselConversionStarting -= OnChiselConversionStarting;
-        RollbackSeams.ChiselConversionCompleted -= OnChiselConversionCompleted;
-        RollbackSeams.ChiselVoxelStarting -= OnChiselVoxelStarting;
-        RollbackSeams.ChiselVoxelCompleted -= OnChiselVoxelCompleted;
+        if (Interlocked.Exchange(ref subscribed, 0) != 0) {
+            RollbackSeams.PlayerPlacementStarting -= OnPlacementStarting;
+            RollbackSeams.PlayerPlacementCompleted -= OnPlacementCompleted;
+            RollbackSeams.PlayerBreakStarting -= OnBreakStarting;
+            RollbackSeams.PlayerBreakCompleted -= OnBreakCompleted;
+            RollbackSeams.ChiselConversionStarting -= OnChiselConversionStarting;
+            RollbackSeams.ChiselConversionCompleted -= OnChiselConversionCompleted;
+            RollbackSeams.ChiselVoxelStarting -= OnChiselVoxelStarting;
+            RollbackSeams.ChiselVoxelCompleted -= OnChiselVoxelCompleted;
+        }
+        lock (watchLock) watchedCoordinates.Clear();
     }
 
     private void OnPlacementStarting(PlayerPlacementSeamContext context) {
@@ -179,7 +238,7 @@ public sealed class BlockMutationCapture : IDisposable {
         }
 
         BlockMutationCoordinate coordinate = Coordinate(position);
-        if (player != null) generations.AddOrUpdate(coordinate, 1, static (_, generation) => checked(generation + 1));
+        if (player != null) IncrementWatchedGeneration(coordinate);
 
         if (!pending.TryGetValue(context, out CapturedBefore? capturedBefore) || capturedBefore == null) return;
         pending.Remove(context);
@@ -233,6 +292,24 @@ public sealed class BlockMutationCapture : IDisposable {
         }
         catch {
             // Logging must not create an unobserved continuation or affect gameplay.
+        }
+    }
+
+    private void IncrementWatchedGeneration(BlockMutationCoordinate coordinate) {
+        lock (watchLock) {
+            if (watchedCoordinates.TryGetValue(coordinate, out BlockMutationWatchCounter? counter)) {
+                checked { counter.Generation++; }
+            }
+        }
+    }
+
+    internal void Unregister(BlockMutationWatch watch,
+        IReadOnlyDictionary<BlockMutationCoordinate, BlockMutationWatchCounter> counters) {
+        lock (watchLock) {
+            foreach ((BlockMutationCoordinate coordinate, BlockMutationWatchCounter counter) in counters) {
+                if (watchedCoordinates.TryGetValue(coordinate, out BlockMutationWatchCounter? current)
+                    && ReferenceEquals(current, counter)) watchedCoordinates.Remove(coordinate);
+            }
         }
     }
 
@@ -368,6 +445,10 @@ public sealed class BlockMutationCapture : IDisposable {
                 if (completed.IsFaulted) {
                     Exception exception = completed.Exception?.GetBaseException()
                         ?? new InvalidOperationException("The database append task faulted without an exception.");
+                    // Queue admission already emits one shared rate-limited health log. Do not
+                    // turn every rejected capture task into coordinate-specific log spam.
+                    if (exception is global::GriefLedger.DatabaseWriterQueueFullException
+                        or global::GriefLedger.DatabaseWriterUnavailableException) return;
                     log(failedMessage, exception);
                 }
                 else if (completed.IsCanceled) {
