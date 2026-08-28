@@ -56,7 +56,7 @@ internal sealed class KeyedPendingTracker<TKey, TValue> where TKey : notnull whe
     }
 }
 
-internal readonly record struct BreakConfirmationKey(string PlayerUid, int X, int Y, int Z);
+internal readonly record struct BreakConfirmationKey(string PlayerUid, int Dimension, int X, int Y, int Z);
 
 internal sealed class PendingBreakConfirmation {
     internal PendingBreakConfirmation(PlayerBreakSeamContext context, RollbackMutationOutcome outcome) {
@@ -89,6 +89,7 @@ internal static class PlayerBlockMutationPatch {
             if (mode is not 0 and not 1) return;
 
             IPlayer byPlayer = player;
+            // Packet Y is BlockPos.InternalY; this constructor derives local Y and dimension.
             var position = new BlockPos(cmd.X, cmd.Y, cmd.Z);
             IWorldAccessor world = byPlayer.Entity.World;
             if (mode == 1) {
@@ -222,8 +223,11 @@ internal static class PlayerBlockMutationPatch {
     }
 
     private static BreakConfirmationKey Key(IPlayer player, BlockPos position) {
-        return new BreakConfirmationKey(player.PlayerUID ?? string.Empty, position.X, position.Y, position.Z);
+        return Key(player.PlayerUID ?? string.Empty, position);
     }
+
+    internal static BreakConfirmationKey Key(string playerUid, BlockPos position) =>
+        new(playerUid, position.dimension, position.X, position.Y, position.Z);
 
     private static void CompletePlacement(PlayerPlacementSeamContext context, bool result) {
         if (context.Outcome != RollbackMutationOutcome.Pending) return;

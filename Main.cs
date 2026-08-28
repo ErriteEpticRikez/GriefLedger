@@ -13,6 +13,7 @@ public class Main : ModSystem {
     public static Database Database { get; private set; }
     public static Dictionary<string, string> CachedPlayerUsernames { get; private set; } = new();
     public static RollbackCapability? ExactRollbackCapability { get; private set; }
+    public static BlockMutationCapture? ExactBlockMutationCapture { get; private set; }
     public static bool ExactRollbackAvailable => ExactRollbackCapability?.IsAvailable == true;
 
     public override bool ShouldLoad(EnumAppSide forSide) {
@@ -20,6 +21,8 @@ public class Main : ModSystem {
     }
 
     public override void StartServerSide(ICoreServerAPI api) {
+        ExactBlockMutationCapture?.Dispose();
+        ExactBlockMutationCapture = null;
         API = api;
         Database = new Database();
 
@@ -40,9 +43,20 @@ public class Main : ModSystem {
             );
         }
         ExactRollbackCapability = RollbackCapability.Initialize(api, harmony);
+        if (ExactRollbackCapability.IsAvailable) {
+            try {
+                ExactBlockMutationCapture = BlockMutationCapture.Attach(api, Database);
+            }
+            catch (System.Exception exception) {
+                ExactBlockMutationCapture = null;
+                API.Logger.Error("GriefLedger: Exact rollback capture could not start; legacy auditing remains enabled. {0}", exception);
+            }
+        }
     }
 
     public override void Dispose() {
+        ExactBlockMutationCapture?.Dispose();
+        ExactBlockMutationCapture = null;
         ExactRollbackCapability?.Dispose();
         ExactRollbackCapability = null;
         Database.Dispose();
